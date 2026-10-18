@@ -1,0 +1,13 @@
+__pycache__/
+.venv*/
+.DS_Store
+results/*
+!results/.gitkeep
+kernels/bench
+kernels/bench_layer
+kernels/bench_packed
+kernels/cpu_sme_bench
+.gpu_timing/
+.gpu_eval_active
+e2e/.dev_active/
+*.rejected-*
