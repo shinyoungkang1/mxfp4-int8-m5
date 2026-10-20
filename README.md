@@ -66,9 +66,10 @@ time: the Qwen3.5-35B-A3B reference and every Qwen3.8-Flash-Next job need most o
 | Qwen3.8-Flash-Next: packing, kernel check, perplexity, spread | `e2e/run_10.sh .venv-q38/bin/python` |
 | Qwen3.8-Flash-Next: prefill and decode speed | `e2e/run_q38_prefill.sh .venv-q38/bin/python` |
 | Qwen3.8-Flash-Next: decode profile | `e2e/tune_decode_q38.py`, `e2e/bench_gemv_q38.py` |
+| Qwen3.8-Flash-Next: the 16-block format on the MoE kernels (pack, check, speed, GSM8K), GSM8K of MLX on our SC-MXFP4 weights, KL and perplexity at equal activation precision, both clock regimes for the smaller MoEs | `e2e/run_11.sh` (one job at a time, about 15 h, restartable) |
 | Kernel comparison with oMLX | `e2e/bench_omlx_q38.py` (in a venv with oMLX 0.7.1 and its M5 kernels, under `run_timed.sh`) |
 
-Qwen3.8-Flash-Next accuracy beyond `run_10.sh`, from `e2e/`:
+Qwen3.8-Flash-Next accuracy beyond `run_10.sh`, from `e2e/` (`run_11.sh` adds the remaining configurations):
 
 ```bash
 PY=../.venv-q38/bin/python; B16="w=fmt:e2m1/B16/M1..10"
@@ -76,8 +77,11 @@ PY=../.venv-q38/bin/python; B16="w=fmt:e2m1/B16/M1..10"
 $PY q38_ppl.py --methods "$B16;a=8;s=experts,w=sc_mx;a=8;s=experts,w=nvfp4;a=8;s=experts,w=nvfp4_search;a=8;s=experts,w=int4_g64;a=16;s=experts,w=mx_spec;a=16;s=experts" --out ../results/10_ppl_qwen38.csv
 # KL divergence to the FP8 model and top-1 flips, 32 windows
 $PY q38_ppl.py --windows 32 --methods "fp8,$B16;a=8;s=experts,w=sc_mx;a=8;s=experts,w=nvfp4_search;a=8;s=experts,w=int4_g64;a=16;s=experts,w=mx_spec;a=16;s=experts,$B16;a=8,sc_mxfp4_w4a8" --out ../results/10_kl_qwen38.csv
-# GSM8K, all 1319 test problems: ours (W4A8) and MLX MXFP4 (W4A16) on the same matrices
+# GSM8K, all 1319 test problems, every matrix quantized: ours (W4A8) with SC-MXFP4 and with the 16-block format,
+# MLX MXFP4 (W4A16) on our SC-MXFP4 weights and with MLX's own quantization of the same matrices
 $PY gsm8k_q38.py --system fused --n 1319 --out ../results/10_gsm8k_fused.jsonl
+$PY gsm8k_q38.py --system fused_b16 --n 1319 --out ../results/11_gsm8k_fused_b16.jsonl
+$PY gsm8k_q38.py --system mlx_sc_mxfp4 --n 1319 --out ../results/11_gsm8k_mlx_sc_mxfp4.jsonl
 $PY gsm8k_q38.py --system mlx_mxfp4 --n 1319 --out ../results/10_gsm8k_mlx_mxfp4.jsonl
 ```
 

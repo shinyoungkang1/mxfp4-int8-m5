@@ -1,6 +1,8 @@
 """GSM8K (5-shot, greedy) on Qwen3.8-Flash-Next systems, batch 1, identical loop for every system:
-  fused      ours: W4A8 prefill (fused_qwen38.FusedQwen38) + W4A8 GEMV decode (DecodeQwen38, dense="ours")
-  mlx_mxfp4  MLX MXFP4 W4A16 on exactly the same matrices (q38_mlx.load_mlx)
+  fused         ours: W4A8 prefill (fused_qwen38.FusedQwen38) + W4A8 GEMV decode (DecodeQwen38, dense="ours")
+  fused_b16     the same with the 16-block integer-exact format (e2m1/B16/M1..10) instead of SC-MXFP4
+  mlx_mxfp4     MLX MXFP4 W4A16 on exactly the same matrices (q38_mlx.load_mlx), MLX's own quantization (OCP rule)
+  mlx_sc_mxfp4  MLX MXFP4 W4A16 on our SC-MXFP4 weights (separates INT8 activations from the weight quantizer)
 Prompt: the first 5 training problems as shots, in chat format with thinking disabled (one user turn "Question: ..."
 and one assistant turn "<solution> #### <n>" per shot; with plain completion this instruct model ends its turn at
 once). Generation stops as lm-eval's gsm8k task does (at "Question:", "<|im_end|>" or the end-of-sequence token) or
@@ -47,9 +49,9 @@ def prompt(shots, q, tok=None):
 
 
 class Fused:
-    def __init__(self):
+    def __init__(self, fmt_name, layers=None):
         import fused_qwen38 as FQ
-        self.f = FQ.FusedQwen38(FQ.SC)
+        self.f = FQ.FusedQwen38(fmt_name or FQ.SC, layers=layers)
         self.d = FQ.DecodeQwen38(self.f, dense="ours")
 
     def start(self, ids):
@@ -61,9 +63,9 @@ class Fused:
 
 
 class Mlx:
-    def __init__(self):
+    def __init__(self, method, layers=None):
         import q38_mlx
-        self.m = q38_mlx.load_mlx("mlx_mxfp4")
+        self.m = q38_mlx.load_mlx(method, layers=layers)
 
     def start(self, ids):
         cache = self.m.make_cache()
@@ -75,10 +77,11 @@ class Mlx:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--system", required=True, choices=["fused", "mlx_mxfp4"])
+    ap.add_argument("--system", required=True, choices=["fused", "fused_b16", "mlx_mxfp4", "mlx_sc_mxfp4"])
     ap.add_argument("--n", type=int, default=500)
     ap.add_argument("--max-tokens", type=int, default=320)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--layers", type=int, default=0, help="first N layers only (smoke test; answers are meaningless)")
     a = ap.parse_args()
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(C.snapshot())
@@ -89,7 +92,8 @@ def main():
         for line in open(a.out):
             r = json.loads(line)
             done[r["i"]] = r
-    sysm = Fused() if a.system == "fused" else Mlx()
+    fmt = {"fused": None, "fused_b16": "e2m1/B16/M1..10"}
+    sysm = Fused(fmt[a.system], a.layers or None) if a.system in fmt else Mlx(a.system, a.layers or None)
     t_all, n_tok = time.time(), 0
     with open(a.out, "a") as fh:
         for i, ex in enumerate(test[:a.n]):
