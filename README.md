@@ -69,6 +69,7 @@ time: the Qwen3.5-35B-A3B reference and every Qwen3.8-Flash-Next job need most o
 | Qwen3.8-Flash-Next: the 16-block format on the MoE kernels (pack, check, speed, GSM8K), GSM8K of MLX on our SC-MXFP4 weights, KL and perplexity at equal activation precision, both clock regimes for the smaller MoEs | `e2e/run_11.sh` (one job at a time, about 15 h, restartable) |
 | Qwen3.8-Flash-Next: DeltaNet reference recurrence vs. Metal kernel, maximum spread and MSE, MLX on our SC-MXFP4 bytes and MLX affine INT4 end to end, 16-block decode profile; NVFP4 W4A8 with scale search (OLMoE, Qwen3.5); Table 1 searches; linear layers timed alike (`bench/layer_wallclock.py`); llama.cpp Q4_K_M and IQ4_XS perplexity and speed (`e2e/ppl_llamacpp.py`) | `e2e/run_12.sh` (one job at a time, about 6-7 h, restartable) |
 | Qwen3.8-Flash-Next decode re-timed after the E8M0 scale-layout fix (ours, MLX on our SC-MXFP4 bytes, MLX MXFP4; dense GEMV comparison) | `e2e/run_13.sh` (about 30-50 min) |
+| WikiText-2 perplexity of our formats under llama.cpp's protocol (`--second-half` in `sim/eval_ppl.py` and `e2e/ppl_qwen35.py`: disjoint 2048-token windows, second half scored), next to llama.cpp's types from `e2e/ppl_llamacpp.py` | `e2e/run_14.sh` (one job at a time, about 1 h, restartable) |
 | Kernel comparison with oMLX | `e2e/bench_omlx_q38.py` (in a venv with oMLX 0.7.1 and its M5 kernels, under `run_timed.sh`) |
 
 Qwen3.8-Flash-Next accuracy beyond `run_10.sh`, from `e2e/` (`run_11.sh` adds the remaining configurations):

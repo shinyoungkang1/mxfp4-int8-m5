@@ -8,7 +8,8 @@ for the rows of results/04_accuracy.md, plus the real systems:
   mlx_mxfp4, mlx_affine4     MLX's checkpoints (these also quantize embeddings, lm_head and routers: mlx_lm default)
   mlx_mxfp4_cov              MLX MXFP4 on exactly the W4A8 matrices (convert_mlx.py ... w4a8cov)
 Router, shared_expert_gate, in_proj_b/a, embeddings and lm_head stay BF16 in all fake-quant rows and in ours.
-Usage: python ppl_qwen35.py [--methods ...] [--out results/08_ppl_qwen35.csv]   (append mode, like eval_ppl.py)
+Usage: python ppl_qwen35.py [--methods ...] [--out results/08_ppl_qwen35.csv] [--second-half]   (append mode, like
+eval_ppl.py; --second-half: llama-perplexity's protocol, see eval_ppl.py)
 """
 import argparse
 import csv
@@ -41,6 +42,8 @@ def main():
                                          "nvfp4_w4a16,int4_affine_g64_w4a16")
     ap.add_argument("--seq", type=int, default=2048)
     ap.add_argument("--out", default=os.path.join(HERE, "..", "results", "08_ppl_qwen35.csv"))
+    ap.add_argument("--second-half", action="store_true",
+                    help="llama-perplexity's protocol: disjoint windows, only the second half of each scored")
     a = ap.parse_args()
     new = not os.path.exists(a.out)
     toks = None
@@ -71,10 +74,11 @@ def main():
                         built[kind] = (model, tok)
             if toks is None:
                 toks = eval_ppl.wikitext_tokens(tok)
-            ppl, n = eval_ppl.perplexity(model, toks, a.seq, 0)
-            wr.writerow([fz.REPO, m, a.seq, n, f"{ppl:.4f}", f"{time.time() - t0:.0f}"])
+            ppl, n = eval_ppl.perplexity(model, toks, a.seq, 0, a.second_half)
+            name = m + (" (second half)" if a.second_half else "")
+            wr.writerow([fz.REPO, name, a.seq, n, f"{ppl:.4f}", f"{time.time() - t0:.0f}"])
             f.flush()
-            print(f"{m:24s} ppl {ppl:8.4f}  ({n} x {a.seq} tokens, {time.time() - t0:.0f}s)", flush=True)
+            print(f"{name:24s} ppl {ppl:8.4f}  ({n} x {a.seq} tokens, {time.time() - t0:.0f}s)", flush=True)
             if m not in FAKE or FAKE[m][0] not in built:
                 del model
             gc.collect()

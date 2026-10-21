@@ -4,7 +4,10 @@ The SC-MXFP4 W4A8 configuration reproduces exactly what kernels/w4a8.metal compu
 (bit-exact through the INT8 embedding) and symmetric per-token INT8 activations on the input of every
 transformer-block linear layer. Embeddings, norms, attention softmax and lm_head stay in BF16.
 
-Usage: python eval_ppl.py <hf-repo> <out.csv> [--methods a,b,...] [--seq 2048] [--max-chunks N]
+Usage: python eval_ppl.py <hf-repo> <out.csv> [--methods a,b,...] [--seq 2048] [--max-chunks N] [--second-half]
+
+--second-half scores as llama.cpp's llama-perplexity does: disjoint seq-token windows, of which only the predictions
+for the second half (seq/2 - 1 tokens) count; the method is recorded with the suffix " (second half)".
 
 Methods are either a name from METHODS or a spec "w=<weights>;a=<8|16>;r=<rotation block or 0>", where
 <weights> is one of the METHODS weight kinds, "fmt:<name>" (a format from formats.FORMATS, round to nearest),
@@ -182,16 +185,18 @@ def wikitext_tokens(tok):
     return np.array(tok.encode(text), dtype=np.int32)
 
 
-def perplexity(model, toks, seq, max_chunks):
-    n = min((len(toks) - 1) // seq, max_chunks or 10 ** 9)
+def perplexity(model, toks, seq, max_chunks, second_half=False):
+    # second_half: llama-perplexity's windows (seq tokens, disjoint) and scored predictions (after the first seq/2)
+    n = min((len(toks) - (0 if second_half else 1)) // seq, max_chunks or 10 ** 9)
+    first = seq // 2 if second_half else 0
     nll, count = 0.0, 0
     for i in range(n):
-        chunk = mx.array(toks[i * seq:(i + 1) * seq + 1])[None]
-        logits = model(chunk[:, :-1]).astype(mx.float32)
-        loss = nn.losses.cross_entropy(logits, chunk[:, 1:], reduction="sum")
+        chunk = mx.array(toks[i * seq:(i + 1) * seq + (0 if second_half else 1)])[None]
+        logits = model(chunk[:, :-1]).astype(mx.float32)[:, first:]
+        loss = nn.losses.cross_entropy(logits, chunk[:, first + 1:], reduction="sum")
         mx.eval(loss)
         nll += loss.item()
-        count += seq
+        count += chunk.shape[1] - 1 - first
     return float(np.exp(nll / count)), n
 
 
@@ -204,6 +209,8 @@ def main():
     ap.add_argument("--max-chunks", type=int, default=0)
     ap.add_argument("--model-config", default="{}",
                     help='JSON overrides for fields missing from config.json, e.g. \'{"rms_norm_eps": 1e-5}\'')
+    ap.add_argument("--second-half", action="store_true",
+                    help="llama-perplexity's protocol: disjoint windows, only the second half of each scored")
     a = ap.parse_args()
     new = not os.path.exists(a.out)
     with open(a.out, "a", newline="") as f:
@@ -220,10 +227,11 @@ def main():
                 if toks is None:
                     toks = wikitext_tokens(tok)
                 quantize_model(model, m, a.repo)
-                ppl, n = perplexity(model, toks, a.seq, a.max_chunks)
-                wr.writerow([a.repo, m, a.seq, n, f"{ppl:.4f}", f"{time.time() - t0:.0f}"])
+                ppl, n = perplexity(model, toks, a.seq, a.max_chunks, a.second_half)
+                name = m + (" (second half)" if a.second_half else "")
+                wr.writerow([a.repo, name, a.seq, n, f"{ppl:.4f}", f"{time.time() - t0:.0f}"])
                 f.flush()
-                print(f"{a.repo} {m:24s} ppl {ppl:8.4f}  ({n} x {a.seq} tokens, {time.time() - t0:.0f}s)", flush=True)
+                print(f"{a.repo} {name:24s} ppl {ppl:8.4f}  ({n} x {a.seq} tokens, {time.time() - t0:.0f}s)", flush=True)
                 del model
 
 
