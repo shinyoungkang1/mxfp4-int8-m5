@@ -50,6 +50,9 @@ def methods():
         "MXFP4 (OCP rule)": (lambda w: q.dequant_mx(w.astype(np.float64), q.block_exponents(w, "spec"))[0], 4.25, False),
         "SC-MXFP4 (standard MXFP4 file)": (F.sc_mxfp4, None, True),
         "NVFP4": (lambda w: q.nvfp4(w.astype(np.float64)), 4.5, False),
+        "NVFP4, scale search": (lambda w: q.nvfp4_search(w.astype(np.float64)), 4.5, False),
+        "MXFP4, exponent search": (lambda w: q.dequant_mx(w.astype(np.float64), q.block_exponents(w, "search"))[0], 4.25,
+                                   False),
         "INT4 affine g64 (MLX)": (lambda w: q.int4_affine(w.astype(np.float64), 64), 4.5, False),
     }
     for name, f in F.FORMATS.items():
@@ -63,13 +66,15 @@ def _out_err(d, h_mx):
     return float(((dm @ h_mx) * dm).sum().item())
 
 
-def main(repo, out_csv, stride=3):
+def main(repo, out_csv, stride=3, only=None):
     calib.compute(repo)
     path = snapshot_download(repo, allow_patterns=["*.safetensors"])
     tensors = {}
     for fn in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
         tensors.update(mx.load(fn))
     ms = methods()
+    if only:  # e.g. "NVFP4, scale search;MXFP4, exponent search": these formats only, no rotated variants
+        ms = {k: v for k, v in ms.items() if k in only}
     rot_names = ["SC-MXFP4 (standard MXFP4 file)", "NVFP4", "e2m1/B32/M1..10", "e2m1/B16/M1..8", "int4/B16/M1..16"]
     num = defaultdict(float); den = defaultdict(float); wnum = defaultdict(float); wden = defaultdict(float)
     bits = {}
@@ -83,7 +88,8 @@ def main(repo, out_csv, stride=3):
                 w = np.array(tensors[key].astype(mx.float32))
                 h = calib.hessian(repo, i, lin)
                 variants = {"": (w, h)}
-                variants["+R32"] = rotate(w, h)
+                if not only:
+                    variants["+R32"] = rotate(w, h)
                 for suffix, (ww, hh) in variants.items():
                     h_mx = mx.array(hh.astype(np.float32))
                     base = _out_err(ww, h_mx)
@@ -112,4 +118,5 @@ def main(repo, out_csv, stride=3):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 3)
+    main(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 3,
+         sys.argv[4].split(";") if len(sys.argv) > 4 else None)

@@ -41,8 +41,10 @@ def main():
     ap.add_argument("--model", required=True, choices=list(MODELS))
     ap.add_argument("--out", default="")
     ap.add_argument("--decode-only", action="store_true")
+    ap.add_argument("--quants", default="", help="comma-separated GGUF types instead of the model's defaults")
     a = ap.parse_args()
     name, quants, lengths = MODELS[a.model]
+    quants = a.quants.split(",") if a.quants else quants
     rows = []
     for q in quants:
         gguf = os.path.join(G, f"{name}-{q}.gguf")

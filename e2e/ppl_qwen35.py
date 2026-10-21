@@ -30,7 +30,8 @@ import ref_qwen35 as rq  # noqa: E402
 
 CACHE = os.path.expanduser("~/.cache/mxfp4-int8-m5")
 FAKE = {"sc_mxfp4_w4a8": ("sc_mx", True), "sc_mxfp4_w4a16": ("sc_mx", False), "nvfp4_w4a16": ("nvfp4", False),
-        "int4_affine_g64_w4a16": ("int4_g64", False)}
+        "int4_affine_g64_w4a16": ("int4_g64", False), "nvfp4_w4a8": ("nvfp4", True),
+        "nvfp4_search_w4a8": ("nvfp4_search", True)}
 
 
 def main():

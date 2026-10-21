@@ -20,10 +20,14 @@ import mx_int8 as q  # noqa: E402
 
 
 def stats(w):
-    """-> rows, violating rows, caused by a large block, caused by a small block."""
+    """-> rows, violating rows, caused by a large block, caused by a small block, squared error of MXFP4 (exponent
+    search), of SC-MXFP4, squared weights, maximum spread."""
     w = np.asarray(w, np.float64)
     e = q.block_exponents(w, "search")
-    bad = (q.exponent_spread(e) > 3).ravel()
+    sp = q.exponent_spread(e)
+    bad = (sp > 3).ravel()
+    err_mx = float(((q.dequant_mx(w, e)[0] - w) ** 2).sum())
+    err_sc = float(((q.dequant_mx(w, q.constrain_spread(w, e))[0] - w) ** 2).sum())
     up = down = 0
     if bad.any():
         amax = np.abs(q.blocks(w[bad])).max(-1)
@@ -31,7 +35,7 @@ def stats(w):
         u = np.log2(amax.max(1) / med)
         d = np.log2(med / np.maximum(amax.min(1), 1e-300))
         up, down = int((u >= d).sum()), int((u < d).sum())
-    return w.shape[0], int(bad.sum()), up, down
+    return w.shape[0], int(bad.sum()), up, down, err_mx, err_sc, float((w ** 2).sum()), int(sp.max())
 
 
 def _job(a):
@@ -46,19 +50,21 @@ def main():
     from gpu_guard import eval_step
     ck = C.Checkpoint()
     args = ck.text_args()
-    acc = defaultdict(lambda: np.zeros(4, np.int64))
+    acc = defaultdict(lambda: np.zeros(7, np.float64))
+    max_spread = [0]
     per_layer = []
     guard = C.MemoryGuard()
     with ProcessPoolExecutor(14) as pool:
         for i in range(args.num_hidden_layers):
             with eval_step():
                 w = ck.layer_weights(i, args.num_experts)
-            lay = np.zeros(4, np.int64)
+            lay = np.zeros(7, np.float64)
 
             def run(jobs):
                 for kind, s in pool.map(_job, jobs, chunksize=4):
-                    acc[kind] += s
-                    lay[:] += s
+                    acc[kind] += s[:7]
+                    lay[:] += s[:7]
+                    max_spread[0] = max(max_spread[0], s[7])
             kinds = P.DENSE[args.layer_types[i]]
             run([(p.split(".")[-1], np.array(w[p + ".weight"].astype(mx.float32))) for p in kinds])
             run([("shared_" + p.split(".")[-1], np.array(w[p + ".weight"].astype(mx.float32))) for p in P.SHARED])
@@ -72,11 +78,13 @@ def main():
             print(f"layer {i}: {lay[1] / lay[0]:.3%} of rows violate", file=sys.stderr, flush=True)
     tot = sum(acc.values())
     print(f"## {C.REPO}: exponent spread of the W4A8 matrices (FP8-decoded experts)\n")
-    print(f"All matrices: {tot[0]:,} rows, **{1 - tot[1] / tot[0]:.3%} INT8-embeddable as standard MXFP4** "
-          f"(spread <= 3); violating rows caused by a large block {tot[2]:,}, by a small block {tot[3]:,}.\n")
+    print(f"All matrices: {int(tot[0]):,} rows, **{1 - tot[1] / tot[0]:.3%} INT8-embeddable as standard MXFP4** "
+          f"(spread <= 3); violating rows caused by a large block {int(tot[2]):,}, by a small block {int(tot[3]):,}.\n")
+    print(f"Maximum spread: {max_spread[0]}. Relative weight MSE x1000: MXFP4 (exponent search) "
+          f"{1000 * tot[4] / tot[6]:.3f} -> SC-MXFP4 {1000 * tot[5] / tot[6]:.3f}.\n")
     print("| matrix | rows | spread > 3 | caused by a large block | caused by a small block |\n|---|---|---|---|---|")
-    for kind, (n, v, up, down) in sorted(acc.items()):
-        print(f"| {kind} | {n:,} | {v / n:.3%} | {up:,} | {down:,} |")
+    for kind, (n, v, up, down, *_) in sorted(acc.items()):
+        print(f"| {kind} | {int(n):,} | {v / n:.3%} | {int(up):,} | {int(down):,} |")
     print("\nPer layer (fraction of rows with spread > 3): "
           + ", ".join(f"{i}: {l[1] / l[0]:.2%}" for i, l in enumerate(per_layer)))
 

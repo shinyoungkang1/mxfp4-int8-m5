@@ -328,7 +328,9 @@ def mxfp4_scales(pw, fmt):
     e = np.log2(np.array(pw.wscale).astype(np.float64))[:, None] + 1 + shifts
     ei = np.rint(e)
     assert np.array_equal(e, ei), "row scale is not a power of two"
-    return mx.array((ei + 127).astype(np.uint8))
+    # row-major: the fancy index above leaves numpy's result column-major, MLX keeps that layout, and its quantized
+    # kernels then copy the whole scale tensor (all 512 experts in gather_qmm) on every call (2.4x slower decode)
+    return mx.array(np.ascontiguousarray((ei + 127).astype(np.uint8)))
 
 
 class DecodeQwen38:

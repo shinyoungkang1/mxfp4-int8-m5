@@ -27,6 +27,8 @@ def main():
     ap.add_argument("--windows", type=int, default=0)
     ap.add_argument("--decode-check", type=int, default=0, help="tokens of window 0 to decode one by one")
     ap.add_argument("--out", default="")
+    ap.add_argument("--reference-deltanet", action="store_true",
+                    help="the PR's op-by-op DeltaNet recurrence (training mode) instead of its Metal kernel")
     a = ap.parse_args()
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(C.snapshot())
@@ -34,6 +36,9 @@ def main():
     n = (len(toks) - 1) // a.seq
     n = min(n, a.windows) if a.windows else n
     f = FQ.FusedQwen38(a.format)
+    if a.reference_deltanet:  # FusedQwen38 puts its layers in inference mode, where DeltaNet uses the Metal kernel
+        for layer, *_ in f.layers:
+            layer.train()
     nll = 0.0
     for b in range(n):
         x = mx.array(toks[b * a.seq:(b + 1) * a.seq + 1])[None]
@@ -43,7 +48,8 @@ def main():
         nll += loss.item()
     ppl = float(np.exp(nll / (n * a.seq)))
     method = "ours_kernels_" + ("sc_mxfp4_w4a8" if a.format == FQ.SC else a.format)
-    row = dict(model=C.REPO, method=method, ppl=round(ppl, 4), windows=n, seq=a.seq)
+    row = dict(model=C.REPO, method=method, ppl=round(ppl, 4), windows=n, seq=a.seq,
+               deltanet="reference" if a.reference_deltanet else "metal")
     print(row, flush=True)
     if a.decode_check:
         # prefill the first token, then decode one at a time; compare with the full-window prefill logits

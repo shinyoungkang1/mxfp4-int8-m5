@@ -74,8 +74,11 @@ def main():
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--configs", default=",".join(CONFIGS))
     ap.add_argument("--dense-only", action="store_true", help="only compare dense='ours' vs dense='mlx' decode")
+    ap.add_argument("--format", default=FQ.SC, help="packed format: sc or a sim/formats.py name (e2m1/B16/M1..10)")
+    ap.add_argument("--breakdown-only", action="store_true", help="skip the tile sweep")
     a = ap.parse_args()
-    f = FQ.FusedQwen38(FQ.SC)
+    f = FQ.FusedQwen38(a.format)
+    print(f"# format {a.format}")
     prompt = mx.array(np.random.default_rng(0).integers(0, 248320, (1, 512)).astype(np.int32))
     if a.dense_only:
         print("## dense projections: our W4A8 GEMV vs MLX's MXFP4 GEMV on the same packed bytes (experts: ours)")
@@ -97,6 +100,8 @@ def main():
             v = [ms_per_step(f, d, prompt, a.tokens) for _ in range(a.reps)]
         print(f"{name:28s} {np.median(v):7.2f} ms  ({1e3 / np.median(v):.1f} tok/s)  sessions {[round(x, 2) for x in v]}",
               flush=True)
+    if a.breakdown_only:
+        return
     print("\n## GEMV tile sweep (tok/s; DecodeQwen38 rebuilt per config, its MoE traced with the config's tiles)")
     for name in a.configs.split(","):
         G.GEMV_TILES.clear()
