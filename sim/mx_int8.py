@@ -157,25 +157,26 @@ def _e4m3_neighbors(x, steps):
     return out
 
 
-def nvfp4_search(w, steps=(-2, -1, 0, 1, 2)):
+def nvfp4_search(w, steps=(-2, -1, 0, 1, 2), return_scale=False):
     """NVFP4 with the block scale chosen by squared-error search over neighbouring E4M3 values (the same kind of
-    scale search the integer-exact formats use), instead of the amax/6 rule."""
+    scale search the integer-exact formats use), instead of the amax/6 rule. return_scale: the block scales (N, K // 16)."""
     b = blocks(w, 16)
     g = max(np.abs(w).max(), 1e-30) / (6 * 448)
     amax = np.abs(b).max(-1, keepdims=True)
     s0 = _q_e4m3(amax / 6 / g)
-    best, best_err = None, None
+    best, best_err, best_s = None, None, None
     for s in _e4m3_neighbors(s0, steps):
         sc = s * g
         dq = round_e2m1(b / sc) * sc
         err = ((dq - b) ** 2).sum(-1, keepdims=True)
         if best is None:
-            best, best_err = dq, err
+            best, best_err, best_s = dq, err, sc
         else:
             m = err < best_err
             best = np.where(m, dq, best)
             best_err = np.where(m, err, best_err)
-    return best.reshape(w.shape)
+            best_s = np.where(m, sc, best_s)
+    return best_s[..., 0] if return_scale else best.reshape(w.shape)
 
 
 def int4_affine(w, group=64):

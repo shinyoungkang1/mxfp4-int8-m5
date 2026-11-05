@@ -48,7 +48,10 @@ def pack_matrix(w, name, fmt):
     f = formats.FORMATS[name]
     wq, qi, base, scales = formats.quantize_mx(np.asarray(w, np.float32), f)
     n, k = qi.shape
-    m = scales / base.astype(np.float64)[:, None]
+    dead = base == 0   # a near-zero row (peak about 1e-37, Qwen3.5) underflows its FP32 base: the row is exactly zero
+    qi = qi.copy()
+    qi[dead] = 0
+    m = np.where(dead[:, None], 1.0, scales / np.where(dead, 1.0, base).astype(np.float64)[:, None])
     mi = np.rint(m).astype(np.int64)
     assert np.array_equal(m, mi), "block scale / row base is not an integer"
     mults = np.array(fmt.mult)

@@ -20,6 +20,8 @@ import mx_int8 as q
 CODEBOOKS = {
     "e2m1": np.array([0, 1, 2, 3, 4, 6, 8, 12], dtype=np.float32),  # doubled E2M1 magnitudes
     "int4": np.arange(8, dtype=np.float32),                         # symmetric INT4, -7..7
+    "s10": np.array([0, 1, 2, 3, 4, 6, 8, 10], dtype=np.float32),   # best shapes of format_space.py that are not E2M1
+    "s14": np.array([0, 1, 2, 3, 5, 7, 10, 14], dtype=np.float32),
 }
 
 
@@ -120,6 +122,10 @@ FORMATS = {
     "int4/B32/M1..16": Fmt("int4", 32, tuple(range(1, 17))),
     "int4/B16/M1..8": Fmt("int4", 16, tuple(range(1, 9))),
     "int4/B16/M1..16": Fmt("int4", 16, tuple(range(1, 17))),
+    "e2m1/B8/M1..10": Fmt("e2m1", 8, tuple(range(1, 11))),            # NVFP4's bit rate (format_space.py)
+    "s10/B8/M1..12": Fmt("s10", 8, tuple(range(1, 13))),
+    "s10/B16/M1..12": Fmt("s10", 16, tuple(range(1, 13))),
+    "s14/B16/M1..9": Fmt("s14", 16, tuple(range(1, 10))),
 }
 
 

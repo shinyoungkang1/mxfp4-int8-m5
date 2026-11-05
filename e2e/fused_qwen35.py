@@ -50,11 +50,21 @@ def _quantize_one(w):
     return F.quantize(np.asarray(w, np.float64))[:3]
 
 
-def pack_qwen35(model, cache_path, workers=14):
-    """SC-MXFP4 (sim/ reference quantizer) of every W4A8 matrix, 2-bit block codes; experts stacked per layer with the
-    shared expert appended as expert E. Cached (about 18 GB)."""
+def _pack_fmt(w, fmt_name, kfmt):
+    import pack_format as pf
+    c, b, s, st = pf.pack_matrix(np.asarray(w, np.float32), fmt_name, kfmt)
+    assert st["exact_q"] and st["exact_w"]
+    return np.asarray(c).reshape(w.shape[0], -1), b, s
+
+
+def pack_qwen35(model, cache_path, workers=14, fmt_name=None):
+    """SC-MXFP4 (sim/ reference quantizer) of every W4A8 matrix, 2-bit block codes, or a sim/formats.py format (fmt_name, on the GPU);
+    experts stacked per layer with the shared expert appended as expert E. Cached (about 18 GB)."""
     if os.path.exists(cache_path):
         return mx.load(cache_path)
+    if fmt_name:
+        import pack_format as pf
+        kfmt = pf.sc_format_of(fmt_name)
     layers = model.language_model.model.layers
     out = {}
     with ProcessPoolExecutor(workers) as ex:
@@ -64,14 +74,15 @@ def pack_qwen35(model, cache_path, workers=14):
                 for p in paths:
                     jobs.append(np.array(get(layer, p).weight.astype(mx.float32)))
                     keys.append(f"layers.{i}.{p}")
-            res = list(ex.map(_quantize_one, jobs))
+            qmany = (lambda ms, **kw: [_pack_fmt(m, fmt_name, kfmt) for m in ms]) if fmt_name else ex.map
+            res = list(qmany(_quantize_one, jobs) if not fmt_name else qmany(jobs))
             for key, (c, b, s) in zip(keys, res):
                 out[key + ".codes"], out[key + ".bcodes"], out[key + ".wscale"] = c, b, s
             for name in EXPERTS:
                 w = np.array(getattr(layer.mlp.switch_mlp, name).weight.astype(mx.float32))
                 ws = np.array(getattr(layer.mlp.shared_expert, name).weight.astype(mx.float32))
                 mats = list(w) + [ws]
-                res = list(ex.map(_quantize_one, mats, chunksize=8))
+                res = list(qmany(_quantize_one, mats, chunksize=8) if not fmt_name else qmany(mats))
                 key = f"layers.{i}.experts.{name}"
                 out[key + ".codes"] = np.stack([r[0] for r in res])
                 out[key + ".bcodes"] = np.stack([r[1] for r in res])
@@ -174,8 +185,9 @@ class FusedQwen35:
             g_c = ek("gate_proj", "codes").reshape(E1, self.Fi, -1)
             u_c = ek("up_proj", "codes").reshape(E1, self.Fi, -1)
             gu_c = np.concatenate([g_c, u_c], 1)[:, perm].reshape(E1, -1)
-            gu_b = np.concatenate([ek("gate_proj", "bcodes"), ek("up_proj", "bcodes")], 1)[:, perm]
-            gu_s = np.concatenate([ek("gate_proj", "wscale"), ek("up_proj", "wscale")], 1)[:, perm]
+            # row-contiguous: fancy indexing keeps a strided layout, and a Metal kernel would copy the whole tensor per call
+            gu_b = np.ascontiguousarray(np.concatenate([ek("gate_proj", "bcodes"), ek("up_proj", "bcodes")], 1)[:, perm])
+            gu_s = np.ascontiguousarray(np.concatenate([ek("gate_proj", "wscale"), ek("up_proj", "wscale")], 1)[:, perm])
             ex = dict(gu=(mx.array(gu_c), mx.array(gu_b), mx.array(gu_s)),
                       down=tuple(mx.array(ek("down_proj", s)) for s in ("codes", "bcodes", "wscale")))
             self.layers.append((layer, kind, ws, ex))
@@ -310,8 +322,14 @@ class _W:
         self.weight = w
 
 
-def load_fused_qwen35(repo=REPO, cache_dir=os.path.expanduser("~/.cache/mxfp4-int8-m5"), **kw):
+def load_fused_qwen35(repo=REPO, cache_dir=os.path.expanduser("~/.cache/mxfp4-int8-m5"), fmt_name=None, **kw):
     from mlx_lm import load
     model, tok = load(repo, lazy=True)
-    flat = pack_qwen35(model, os.path.join(cache_dir, repo.replace("/", "--") + "-scmxfp4-p2.safetensors"))
+    if fmt_name:
+        import pack_format as pf
+        S.set_format(pf.sc_format_of(fmt_name))
+        path = repo.replace("/", "--") + "-fmt-" + pf.slug(fmt_name) + ".safetensors"
+    else:
+        path = repo.replace("/", "--") + "-scmxfp4-p2.safetensors"
+    flat = pack_qwen35(model, os.path.join(cache_dir, path), fmt_name=fmt_name)
     return FusedQwen35(model, flat, **kw), tok

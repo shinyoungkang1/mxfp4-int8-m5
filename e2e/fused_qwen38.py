@@ -158,8 +158,9 @@ class FusedQwen38:
             E1 = self.E + 1
             g_c, u_c = npy("experts.gate_proj.codes").reshape(E1, self.Fi, -1), npy("experts.up_proj.codes").reshape(E1, self.Fi, -1)
             gu_c = np.concatenate([g_c, u_c], 1)[:, perm].reshape(E1, -1)
-            gu_b = np.concatenate([npy("experts.gate_proj.bcodes"), npy("experts.up_proj.bcodes")], 1)[:, perm]
-            gu_s = np.concatenate([npy("experts.gate_proj.wscale"), npy("experts.up_proj.wscale")], 1)[:, perm]
+            # row-contiguous: fancy indexing keeps a strided layout, and a Metal kernel would copy the whole tensor per call
+            gu_b = np.ascontiguousarray(np.concatenate([npy("experts.gate_proj.bcodes"), npy("experts.up_proj.bcodes")], 1)[:, perm])
+            gu_s = np.ascontiguousarray(np.concatenate([npy("experts.gate_proj.wscale"), npy("experts.up_proj.wscale")], 1)[:, perm])
             ex = dict(gu=(mx.array(gu_c), mx.array(gu_b), mx.array(gu_s)),
                       down=tuple(flat[f"experts.down_proj.{s}"] for s in ("codes", "bcodes", "wscale")))
             del flat, g_c, u_c, gu_c, gu_b, gu_s

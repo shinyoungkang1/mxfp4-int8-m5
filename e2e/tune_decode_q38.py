@@ -76,9 +76,19 @@ def main():
     ap.add_argument("--dense-only", action="store_true", help="only compare dense='ours' vs dense='mlx' decode")
     ap.add_argument("--format", default=FQ.SC, help="packed format: sc or a sim/formats.py name (e2m1/B16/M1..10)")
     ap.add_argument("--breakdown-only", action="store_true", help="skip the tile sweep")
+    ap.add_argument("--old-layout", action="store_true", help="restore the strided gate|up bcodes / wscale of runs before "
+                    "2026-11-03 (each kernel call then copies them)")
     a = ap.parse_args()
     f = FQ.FusedQwen38(a.format)
-    print(f"# format {a.format}")
+    if a.old_layout:
+        for _, _, _, ex, _ in f.layers:
+            c, b, s = ex["gu"]
+            ident = np.arange(b.shape[1])
+            ex["gu"] = (c, mx.array(np.array(b)[:, ident]), mx.array(np.array(s)[:, ident]))
+            mx.eval(ex["gu"])
+    print(f"# format {a.format}{' (old strided layout)' if a.old_layout else ''}")
+    x0 = f.layers[0][3]["gu"]
+    print("# gate|up strides: bcodes", np.array(x0[1], copy=False).strides, "wscale", np.array(x0[2], copy=False).strides)
     prompt = mx.array(np.random.default_rng(0).integers(0, 248320, (1, 512)).astype(np.int32))
     if a.dense_only:
         print("## dense projections: our W4A8 GEMV vs MLX's MXFP4 GEMV on the same packed bytes (experts: ours)")

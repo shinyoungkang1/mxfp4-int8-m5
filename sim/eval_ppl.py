@@ -11,9 +11,10 @@ for the second half (seq/2 - 1 tokens) count; the method is recorded with the su
 
 Methods are either a name from METHODS or a spec "w=<weights>;a=<8|16>;r=<rotation block or 0>", where
 <weights> is one of the METHODS weight kinds, "fmt:<name>" (a format from formats.FORMATS, round to nearest),
-"gptq:<name>" (same format with GPTQ rounding) or "gptq:sc_mx" (SC-MXFP4 with GPTQ rounding). GPTQ uses
+"gptq:<name>" (same format with GPTQ rounding), "gptq:sc_mx" or "gptq:nvfp4_search" (those two with GPTQ rounding). GPTQ uses
 calibration Hessians from calib.py (WikiText-2 train), computed once per model.
-Example: --methods "w=gptq:e2m1/B16/M1..8;a=8;r=32"
+Example: --methods "w=gptq:e2m1/B16/M1..8;a=8;r=32". An optional "p=<linear>" (e.g. p=mlp.down_proj) applies activations and rotation to that
+kind of linear layer only.
 """
 import argparse
 import csv
@@ -75,6 +76,8 @@ def fake_weight(w, kind, h=None):
         assert h is not None, "GPTQ needs a calibration Hessian (not available for MoE experts)"
         if kind == "gptq:sc_mx":
             return G.gptq(w, h, G.sc_mxfp4_scales(w), q.E2M1)
+        if kind == "gptq:nvfp4_search":
+            return G.gptq(w, h, q.nvfp4_search(w, return_scale=True), q.E2M1)
         f = F.FORMATS[kind[5:]]
         return G.gptq(w, h, F.quantize_mx(w, f)[3], F.CODEBOOKS[f.codebook])
     if kind == "mx_spec":
@@ -160,6 +163,7 @@ class QSwitchLinear(nn.Module):
 
 def quantize_model(model, method, repo=None):
     wkind, act8, had = parse_method(method)
+    only = dict(part.split("=", 1) for part in method.split(";") if "=" in part).get("p")
     if wkind is None and not act8 and not had:
         return
     need_h = bool(wkind) and wkind.startswith("gptq:")
@@ -169,7 +173,8 @@ def quantize_model(model, method, repo=None):
             parent = getattr(layer, parent_name)
             if hasattr(parent, name):
                 h = calib.hessian(repo, i, path) if need_h else None
-                setattr(parent, name, QLinear(getattr(parent, name), wkind, act8, had, h))
+                on = only is None or only == path
+                setattr(parent, name, QLinear(getattr(parent, name), wkind, act8 and on, had if on else 0, h))
         switch = getattr(layer.mlp, "switch_mlp", None)  # MoE experts; the router (mlp.gate) stays BF16
         if switch is not None:
             if had:
@@ -185,7 +190,7 @@ def wikitext_tokens(tok):
     return np.array(tok.encode(text), dtype=np.int32)
 
 
-def perplexity(model, toks, seq, max_chunks, second_half=False):
+def perplexity(model, toks, seq, max_chunks, second_half=False, per_window=None):
     # second_half: llama-perplexity's windows (seq tokens, disjoint) and scored predictions (after the first seq/2)
     n = min((len(toks) - (0 if second_half else 1)) // seq, max_chunks or 10 ** 9)
     first = seq // 2 if second_half else 0
@@ -197,6 +202,8 @@ def perplexity(model, toks, seq, max_chunks, second_half=False):
         mx.eval(loss)
         nll += loss.item()
         count += chunk.shape[1] - 1 - first
+        if per_window is not None:
+            per_window.append((loss.item(), chunk.shape[1] - 1 - first))
     return float(np.exp(nll / count)), n
 
 
@@ -211,6 +218,7 @@ def main():
                     help='JSON overrides for fields missing from config.json, e.g. \'{"rms_norm_eps": 1e-5}\'')
     ap.add_argument("--second-half", action="store_true",
                     help="llama-perplexity's protocol: disjoint windows, only the second half of each scored")
+    ap.add_argument("--windows-dir", default="", help="also save each window's summed NLL and token count (for paired bootstrap)")
     a = ap.parse_args()
     new = not os.path.exists(a.out)
     with open(a.out, "a", newline="") as f:
@@ -227,7 +235,12 @@ def main():
                 if toks is None:
                     toks = wikitext_tokens(tok)
                 quantize_model(model, m, a.repo)
-                ppl, n = perplexity(model, toks, a.seq, a.max_chunks, a.second_half)
+                pw = [] if a.windows_dir else None
+                ppl, n = perplexity(model, toks, a.seq, a.max_chunks, a.second_half, pw)
+                if pw:
+                    os.makedirs(a.windows_dir, exist_ok=True)
+                    tag = (a.repo + "__" + m).replace("/", "_").replace(";", "_").replace("=", "-").replace(":", "-")
+                    np.savez(os.path.join(a.windows_dir, tag + ".npz"), nll=np.array([x[0] for x in pw]), count=np.array([x[1] for x in pw]))
                 name = m + (" (second half)" if a.second_half else "")
                 wr.writerow([a.repo, name, a.seq, n, f"{ppl:.4f}", f"{time.time() - t0:.0f}"])
                 f.flush()

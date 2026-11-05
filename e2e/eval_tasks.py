@@ -59,7 +59,7 @@ def load_method(model_name, method, cache_dir):
         packed = {"ours_gptq": "gptq", "ours_fmt": "fmt:" + FORMAT[0]}.get(method, "rtn")
         return fq.load_fused(repo, cache_dir, packed=packed)
     import fused_qwen35 as fz
-    return fz.load_fused_qwen35(repo, cache_dir)
+    return fz.load_fused_qwen35(repo, cache_dir, fmt_name=FORMAT[0] if method == "ours_fmt" else None)
 
 
 def main():
@@ -67,7 +67,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, choices=list(REPOS))
     ap.add_argument("--method", required=True, choices=["bf16", "mlx_mxfp4", "mlx_affine4", "mlx_mxfp4_cov", "mlx_affine4_cov",
-                                                         "ours", "ours_gptq", "ours_fmt"])
+                                                         "ours", "ours_gptq", "ours_fmt", "fake"])
+    ap.add_argument("--fake", default="", help="method fake: a sim/eval_ppl.py method string (fake quantization, e.g. w=gptq:sc_mx;a=8;r=32)")
     ap.add_argument("--format", default=FORMAT[0])
     ap.add_argument("--tasks", default=",".join(TASKS))
     ap.add_argument("--limit", type=int, default=0)
@@ -75,14 +76,21 @@ def main():
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     FORMAT[0] = a.format
-    model, tok = load_method(a.model, a.method, a.cache_dir)
+    if a.method == "fake":
+        from mlx_lm import load
+        sys.path.insert(0, os.path.join(HERE, "..", "sim"))
+        import eval_ppl
+        model, tok = load(REPOS[a.model])
+        eval_ppl.quantize_model(model, a.fake, REPOS[a.model])
+    else:
+        model, tok = load_method(a.model, a.method, a.cache_dir)
     res = lm_eval.simple_evaluate(model=make_lm(model, tok), tasks=a.tasks.split(","), num_fewshot=0,
                                   limit=a.limit or None, random_seed=0, numpy_random_seed=0, torch_random_seed=0,
                                   fewshot_random_seed=0)
     out = a.out or os.path.join(HERE, "..", "results",
                                 f"{'10' if a.model == 'qwen38' else '08'}_tasks_{a.model}_{a.method}.json")
     keep = {"results": res["results"], "n-samples": res.get("n-samples"), "config": {
-        "model": REPOS[a.model], "method": a.method, "limit": a.limit or None, "num_fewshot": 0,
+        "model": REPOS[a.model], "method": a.method, "fake": a.fake, "limit": a.limit or None, "num_fewshot": 0,
         "lm_eval": lm_eval.__version__}}
     with open(out, "w") as f:
         json.dump(keep, f, indent=1, default=str)

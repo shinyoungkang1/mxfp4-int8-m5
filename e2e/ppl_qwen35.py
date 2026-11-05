@@ -32,7 +32,8 @@ import ref_qwen35 as rq  # noqa: E402
 CACHE = os.path.expanduser("~/.cache/mxfp4-int8-m5")
 FAKE = {"sc_mxfp4_w4a8": ("sc_mx", True), "sc_mxfp4_w4a16": ("sc_mx", False), "nvfp4_w4a16": ("nvfp4", False),
         "int4_affine_g64_w4a16": ("int4_g64", False), "nvfp4_w4a8": ("nvfp4", True),
-        "nvfp4_search_w4a8": ("nvfp4_search", True)}
+        "nvfp4_search_w4a8": ("nvfp4_search", True),
+        "b16_w4a8": ("fmt:e2m1/B16/M1..10", True), "b8_w4a8": ("fmt:e2m1/B8/M1..10", True)}
 
 
 def main():
@@ -56,6 +57,8 @@ def main():
             t0 = time.time()
             if m == "ours":
                 model, tok = fz.load_fused_qwen35()
+            elif m == "ours_b16":
+                model, tok = fz.load_fused_qwen35(fmt_name="e2m1/B16/M1..10")
             elif m.startswith("mlx_"):
                 suffix = {"mlx_mxfp4": "mxfp4", "mlx_affine4": "4bit", "mlx_mxfp4_cov": "mxfp4-w4a8cov"}[m]
                 model, tok = load(os.path.join(CACHE, "Qwen3.5-35B-A3B-Base-" + suffix))
