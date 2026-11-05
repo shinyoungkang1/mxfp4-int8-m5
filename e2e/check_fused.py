@@ -66,6 +66,8 @@ def main():
     unf = w.load_w4a8(a.repo, a.cache_dir)[0] if a.packed == "rtn" else None
     ref, _ = load(a.repo)
     ref_method = {"rtn": "sc_mxfp4_w4a8", "gptq": "w=gptq:sc_mx;a=8"}.get(a.packed, f"w={a.packed};a=8")
+    if a.packed.startswith("rot:"):
+        ref_method = f"w=gptq:{a.packed[4:]};a=8;r=32"
     rep["reference_method"] = ref_method
     eval_ppl.quantize_model(ref, ref_method, a.repo)
     S.set_format(fused.fmt)
@@ -115,6 +117,10 @@ def main():
             acc = S.mm_i8_i32(xq, wq)
         acc_np = np.array(acc[:L]).astype(np.float64)
         acc_ref = np.array(xq[:L]).astype(np.float64) @ np.array(wq).astype(np.float64).T
+        if fused.rot:  # the reference's rotation, a float32 matmul (the kernel's butterflies can round differently before BF16)
+            sh = xr.shape
+            hb = mx.array(eval_ppl.hadamard(32).astype(np.float32))
+            xr = ((xr.astype(mx.float32) * fused.signs(sh[1])).reshape(sh[0], -1, 32) @ hb).reshape(sh).astype(xr.dtype)
         nd = int(mx.sum(ref_codes(xr) != xq[:L].astype(mx.float32)).item())
         gemm[f"{i}.{g}"] = {"M": L, "N": int(wq.shape[0]), "K": int(wq.shape[1]),
                             "int32_max_abs_err": float(np.abs(acc_np - acc_ref).max()),

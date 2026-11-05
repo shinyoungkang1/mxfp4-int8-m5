@@ -6,6 +6,7 @@ sim/eval_ppl.py, comparable with results/ppl.csv):
                              gptq_pack.py runs the same gptq.gptq call as eval_ppl.fake_weight("gptq:sc_mx") and checks
                              that the packed weights decode to its output exactly (float64, every matrix), so these are
                              eval_ppl's weights bit for bit without recomputing GPTQ serially (~5 CPU-hours here)
+  ours_rot:<name>            the fused W4A8 model with rotated inputs and GPTQ weights in the rotated basis (e2e/pack_rot.py)
   ours_fmt:<name>            the fused W4A8 model in another sim/formats.py format (e2e/pack_format.py)
   w=...                      any other sim/eval_ppl.py method string (recomputes its weights)
 Usage: python ppl_gptq_qwen3.py [--methods ...] [--out results/08_gptq_ppl_qwen3.csv]   (append mode)
@@ -67,7 +68,9 @@ def main():
             wr.writerow(["model", "method", "seq", "chunks", "ppl", "seconds"])
         for m in a.methods.split(","):
             t0 = time.time()
-            if m.startswith("ours_fmt:"):
+            if m.startswith("ours_rot:"):
+                model, tok = fq.load_fused(REPO, CACHE, packed="rot:" + m[len("ours_rot:"):])
+            elif m.startswith("ours_fmt:"):
                 model, tok = fq.load_fused(REPO, CACHE, packed="fmt:" + m[len("ours_fmt:"):])
             elif m in ("ours", "ours_gptq"):
                 model, tok = fq.load_fused(REPO, CACHE, packed="gptq" if m == "ours_gptq" else "rtn")

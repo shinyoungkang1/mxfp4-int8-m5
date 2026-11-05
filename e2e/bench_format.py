@@ -34,12 +34,15 @@ def main():
     ap.add_argument("--lengths", default="512,2048")
     ap.add_argument("--ctx", default="512,2048")
     ap.add_argument("--reps", type=int, default=7)
+    ap.add_argument("--rot", action="store_true", help="also the same format with rotated inputs (packed by e2e/pack_rot.py)")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     mxm = load(os.path.join(CACHE, REPO.split("/")[-1] + "-mxfp4"))[0]
     f_sc = fq.load_fused(REPO, CACHE)[0]
     f_new = fq.load_fused(REPO, CACHE, packed="fmt:" + a.format)[0]
     names = {"fused_scmxfp4": f_sc, "fused_" + a.format: f_new}
+    if a.rot:
+        names["fused_" + a.format + "_rot"] = fq.load_fused(REPO, CACHE, packed="rot:" + a.format)[0]
     state = bp.power_state()
     if a.what == "prefill":
         models = {"mlx_mxfp4": bf.Plain(mxm), **{k: bf.Fused(v) for k, v in names.items()}}

@@ -22,6 +22,8 @@ CODEBOOKS = {
     "int4": np.arange(8, dtype=np.float32),                         # symmetric INT4, -7..7
     "s10": np.array([0, 1, 2, 3, 4, 6, 8, 10], dtype=np.float32),   # best shapes of format_space.py that are not E2M1
     "s14": np.array([0, 1, 2, 3, 5, 7, 10, 14], dtype=np.float32),
+    "c10": np.array([0, 1, 2, 3, 4, 5, 7, 10], dtype=np.float32),   # top code compressed: 12 multipliers, then 14
+    "c9": np.array([0, 1, 2, 3, 4, 5, 7, 9], dtype=np.float32),
 }
 
 
@@ -112,6 +114,8 @@ def sc_mxfp4(w):
 
 
 FORMATS = {
+    "c10/B8/M1..12": Fmt("c10", 8, tuple(range(1, 13))),
+    "c9/B8/M1..14": Fmt("c9", 8, tuple(range(1, 15))),
     # standard-MXFP4-compatible reference is handled separately (sc_mxfp4)
     "e2m1/B32/pow2 (SC-MXFP4 grid, float row base)": Fmt("e2m1", 32, (1, 2, 4, 8)),
     "e2m1/B16/pow2": Fmt("e2m1", 16, (1, 2, 4, 8)),

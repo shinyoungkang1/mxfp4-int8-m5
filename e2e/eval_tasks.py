@@ -56,7 +56,7 @@ def load_method(model_name, method, cache_dir):
         return load(os.path.join(cache_dir, base + suffix))
     if model_name == "qwen3":
         import fused_qwen3 as fq
-        packed = {"ours_gptq": "gptq", "ours_fmt": "fmt:" + FORMAT[0]}.get(method, "rtn")
+        packed = {"ours_gptq": "gptq", "ours_fmt": "fmt:" + FORMAT[0], "ours_rot": "rot:" + FORMAT[0]}.get(method, "rtn")
         return fq.load_fused(repo, cache_dir, packed=packed)
     import fused_qwen35 as fz
     return fz.load_fused_qwen35(repo, cache_dir, fmt_name=FORMAT[0] if method == "ours_fmt" else None)
@@ -67,7 +67,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, choices=list(REPOS))
     ap.add_argument("--method", required=True, choices=["bf16", "mlx_mxfp4", "mlx_affine4", "mlx_mxfp4_cov", "mlx_affine4_cov",
-                                                         "ours", "ours_gptq", "ours_fmt", "fake"])
+                                                         "ours", "ours_gptq", "ours_fmt", "ours_rot", "fake"])
     ap.add_argument("--fake", default="", help="method fake: a sim/eval_ppl.py method string (fake quantization, e.g. w=gptq:sc_mx;a=8;r=32)")
     ap.add_argument("--format", default=FORMAT[0])
     ap.add_argument("--tasks", default=",".join(TASKS))

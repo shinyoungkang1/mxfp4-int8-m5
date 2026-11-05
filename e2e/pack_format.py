@@ -47,6 +47,11 @@ def pack_matrix(w, name, fmt):
     import formats
     f = formats.FORMATS[name]
     wq, qi, base, scales = formats.quantize_mx(np.asarray(w, np.float32), f)
+    return pack_parts(wq, qi, base, scales, fmt)
+
+
+def pack_parts(wq, qi, base, scales, fmt):
+    """(float32 weights, INT8 operands, row bases, block scales) -> (codes, bcodes, wscale, stats) in `fmt`."""
     n, k = qi.shape
     dead = base == 0   # a near-zero row (peak about 1e-37, Qwen3.5) underflows its FP32 base: the row is exactly zero
     qi = qi.copy()

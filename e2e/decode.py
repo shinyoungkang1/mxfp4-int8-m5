@@ -56,7 +56,7 @@ class DecodeQwen3:
             fa = fuse_prologue == "act"
 
             def pre(h, c, b, s, inn, qn, kn):
-                xq, xs = S.rmsnorm_quant(h, inn, eps, 1)
+                xq, xs = fused.rms_q(h, inn, 1)
                 y = G.gemv(xq, c, b, xs, s, (hq + 2 * hk) * d, 1)
                 return S.qkv_headnorm_y(y[None], qn, kn, eps, 1, hq, hk, d)
 
@@ -64,13 +64,13 @@ class DecodeQwen3:
                 if fa:
                     h = G.gemv(o, co, bo, None, so, so.size, 2, res=h, pro=1)[None]
                 else:
-                    xq, xs = S.act_quant(o, 1)
+                    xq, xs = fused.act_q(o, 1)
                     h = G.gemv(xq, co, bo, xs, so, so.size, 2, res=h)[None]
-                xq, xs = S.rmsnorm_quant(h, pn, eps, 1)
+                xq, xs = fused.rms_q(h, pn, 1)
                 act = G.gemv(xq, cg, bg, xs, sg, sg.size, 3)
                 if fa:
                     return G.gemv(act, cd, bd, None, sd, sd.size, 2, res=h, pro=1)[None]
-                xq, xs = S.act_quant(act[None], 1)
+                xq, xs = fused.act_q(act[None], 1)
                 return G.gemv(xq, cd, bd, xs, sd, sd.size, 2, res=h)[None]
 
         self._pre, self._post = (mx.compile(pre), mx.compile(post)) if compiled else (pre, post)

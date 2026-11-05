@@ -14,7 +14,7 @@ Methods are either a name from METHODS or a spec "w=<weights>;a=<8|16>;r=<rotati
 "gptq:<name>" (same format with GPTQ rounding), "gptq:sc_mx" or "gptq:nvfp4_search" (those two with GPTQ rounding). GPTQ uses
 calibration Hessians from calib.py (WikiText-2 train), computed once per model.
 Example: --methods "w=gptq:e2m1/B16/M1..8;a=8;r=32". An optional "p=<linear>" (e.g. p=mlp.down_proj) applies activations and rotation to that
-kind of linear layer only.
+kind of linear layer only; "rp=<linear>" applies only the rotation to that kind, with activations everywhere.
 """
 import argparse
 import csv
@@ -163,7 +163,8 @@ class QSwitchLinear(nn.Module):
 
 def quantize_model(model, method, repo=None):
     wkind, act8, had = parse_method(method)
-    only = dict(part.split("=", 1) for part in method.split(";") if "=" in part).get("p")
+    kv = dict(part.split("=", 1) for part in method.split(";") if "=" in part)
+    only, rot_only = kv.get("p"), kv.get("rp")
     if wkind is None and not act8 and not had:
         return
     need_h = bool(wkind) and wkind.startswith("gptq:")
@@ -174,7 +175,8 @@ def quantize_model(model, method, repo=None):
             if hasattr(parent, name):
                 h = calib.hessian(repo, i, path) if need_h else None
                 on = only is None or only == path
-                setattr(parent, name, QLinear(getattr(parent, name), wkind, act8 and on, had if on else 0, h))
+                rotated = on and (rot_only is None or rot_only == path)
+                setattr(parent, name, QLinear(getattr(parent, name), wkind, act8 and on, had if rotated else 0, h))
         switch = getattr(layer.mlp, "switch_mlp", None)  # MoE experts; the router (mlp.gate) stays BF16
         if switch is not None:
             if had:
