@@ -228,47 +228,50 @@ _ACT_QUANT = """
     if (lid == 0) xs[row] = s;
 """
 
-# Randomized Hadamard rotation of each ROT_B-wide block, then per-token INT8: the same x -> (x D H_b), BF16, as sim/eval_ppl.QLinear (r=32),
-# with a fast Walsh-Hadamard transform in FP32 instead of a matmul. J blocks per thread.
+# Randomized Hadamard rotation of each 32-wide block, then per-token INT8: the same x -> (x D H_b), BF16, as sim/eval_ppl.QLinear (r=32), with a fast Walsh-Hadamard
+# transform in FP32 instead of a matmul. Laid out like _ACT_QUANT: 4 values per thread, 8 threads per block, the last three stages across SIMD lanes (simd_shuffle_xor).
+# A per-thread array of 32 floats (results/31_ablate_decode.csv: 0.56x of MLX in decode) gave the same outputs at 0.86x with this layout.
 _ROT_QUANT = """
-    const uint row = threadgroup_position_in_grid.x, lid = thread_position_in_threadgroup.x;
+    const uint row = threadgroup_position_in_grid.x;
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    const uint t = sg * 32 + lane;
     threadgroup float red[32];
     threadgroup float shared_amax;
-    constexpr int J = K / (ROT_B * NT);
-    float v[J][ROT_B];
+    constexpr int J = K / (4 * NT);
+    float4 v[J];
     float amax = 0;
     for (int j = 0; j < J; ++j) {
-        const size_t b0 = size_t(ROT_B) * (j * NT + lid);
-        for (int i = 0; i < ROT_B; ++i)
-            v[j][i] = row < M ? float(x[size_t(row) * K + b0 + i]) * signs[b0 + i] : 0.0f;
-        for (int h = 1; h < ROT_B; h *= 2)
-            for (int i = 0; i < ROT_B; i += 2 * h)
-                for (int k = i; k < i + h; ++k) {
-                    const float a = v[j][k], c = v[j][k + h];
-                    v[j][k] = a + c;
-                    v[j][k + h] = a - c;
-                }
-        for (int i = 0; i < ROT_B; ++i) {
-            v[j][i] = float(static_cast<T>(v[j][i] * ROT_NORM));
-            amax = max(amax, abs(v[j][i]));
+        const size_t p = 4 * (size_t(j) * NT + t);
+        float4 a;
+        for (int i = 0; i < 4; ++i) a[i] = row < M ? float(x[size_t(row) * K + p + i]) * signs[p + i] : 0.0f;
+        a = float4(a.x + a.y, a.x - a.y, a.z + a.w, a.z - a.w);
+        a = float4(a.x + a.z, a.y + a.w, a.x - a.z, a.y - a.w);
+        for (ushort h = 1; h < 8; h *= 2) {
+            const float4 c = simd_shuffle_xor(a, h);
+            a = (t & h) ? c - a : a + c;
         }
+        for (int i = 0; i < 4; ++i) {
+            a[i] = float(static_cast<T>(a[i] * ROT_NORM));
+            amax = max(amax, abs(a[i]));
+        }
+        v[j] = a;
     }
     amax = simd_max(amax);
     if (lane == 0) red[sg] = amax;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {
-        amax = simd_max(lane < (NT + 31) / 32 ? red[lane] : 0.0f);
+        amax = simd_max(lane < NT / 32 ? red[lane] : 0.0f);
         if (lane == 0) shared_amax = amax;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float s = shared_amax / 127.0f;
     const float qi = s > 0 ? 1.0f / s : 0.0f;
     for (int j = 0; j < J; ++j) {
-        const size_t b0 = size_t(row) * K + size_t(ROT_B) * (j * NT + lid);
-        for (int i = 0; i < ROT_B; ++i) xq[b0 + i] = char(clamp(rint(v[j][i] * qi), -127.0f, 127.0f));
+        char4 q;
+        for (int i = 0; i < 4; ++i) q[i] = char(clamp(rint(v[j][i] * qi), -127.0f, 127.0f));
+        *(device char4 *)(xq + size_t(row) * K + 4 * (size_t(j) * NT + t)) = q;
     }
-    if (lid == 0) xs[row] = s;
+    if (t == 0) xs[row] = s;
 """
 
 # SiLU(gate) * up on the BF16 GEMM outputs (gate = columns [0, F), up = [F, 2F) of the concatenated GEMM), rounded
@@ -566,17 +569,15 @@ def rot_signs(K):
     return mx.array(np.random.default_rng(0).choice([-1.0, 1.0], size=K).astype(np.float32))
 
 
-def rot_quant(x, signs, Mp=None, nt=64, deps=()):
+def rot_quant(x, signs, Mp=None, nt=512, deps=()):
     """x [M, K] -> (xq int8 [Mp, K], xscale f32 [Mp]): rotation of each 32-wide block, then per-token INT8."""
     M, K = x.shape
     Mp = Mp or pad_rows(M)
-    blocks = K // 32
     assert K % 32 == 0
-    nt = min(nt, blocks)
-    while blocks % nt:
+    nt = min(nt, K // 4)
+    while (K // 4) % nt or nt % 32:  # threads = whole simdgroups dividing K / 4
         nt -= 1
-    k = _kernel("rot_quant", ["x", "signs"], ["xq", "xs"], _ROT_QUANT, len(deps),
-                header_extra="\n#define ROT_B 32\n#define ROT_NORM 0.17677669529663687f\n")
+    k = _kernel("rot_quant", ["x", "signs"], ["xq", "xs"], _ROT_QUANT, len(deps), header_extra="\n#define ROT_NORM 0.17677669529663687f\n")
     return k(inputs=[x, signs, *deps], template=[("T", x.dtype), ("K", K), ("M", M), ("NT", nt)], grid=(Mp * nt, 1, 1),
              threadgroup=(nt, 1, 1), output_shapes=[(Mp, K), (Mp,)], output_dtypes=[mx.int8, mx.float32])
 

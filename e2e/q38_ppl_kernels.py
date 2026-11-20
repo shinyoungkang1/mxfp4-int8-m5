@@ -17,6 +17,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "sim"))
 import eval_ppl as E  # noqa: E402
 import fused_qwen38 as FQ  # noqa: E402
+import provenance as prov  # noqa: E402
 import q38_ckpt as C  # noqa: E402
 
 
@@ -71,6 +72,9 @@ def main():
             if new:
                 wr.writeheader()
             wr.writerow(row)
+        prov.sidecar(a.out, model=C.REPO, method=method, format="scmxfp4" if a.format == FQ.SC else a.format,
+                     pack=FQ.pack_dir(a.format, os.path.expanduser("~/.cache/mxfp4-int8-m5")), windows=n, seq=a.seq,
+                     deltanet=row["deltanet"])
 
 
 if __name__ == "__main__":

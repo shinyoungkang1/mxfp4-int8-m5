@@ -85,7 +85,8 @@ class FusedQwen3:
     compiled=True (gemm path): each block's halves before / after attention run as mx.compile'd functions."""
 
     def __init__(self, model, packed, resident=False, overlap=False, epilogue="gemm", compiled=True, fmt=None, rot=False):
-        # rot: inputs rotated before INT8 (S.rot_quant) for weights packed in the rotated basis (load_fused packed="rot:<name>")
+        # rot: inputs rotated before INT8 (S.rot_quant) for weights packed in the rotated basis (load_fused packed="rot:<name>");
+        # rot="down": only the down projection's input and weights (packed="rotdown:<name>")
         self.rot, self._signs = rot, {}
         # fmt: the packed weights' sc_format.Format, installed (S.set_format) at every call, so that models in
         # different formats can run in one process
@@ -113,12 +114,12 @@ class FusedQwen3:
         self.record, self.record_layers = None, ()  # check_fused.py: {(layer, group): (input, xq, wq, acc)}
 
     def rms_q(self, h, nw, Mp=None):
-        if not self.rot:
+        if self.rot is not True:
             return S.rmsnorm_quant(h, nw, self.eps, Mp)
         return S.rot_quant(mx.fast.rms_norm(h, nw, self.args.rms_norm_eps), self.signs(h.shape[1]), Mp)
 
-    def act_q(self, x, Mp=None, nt=256):
-        if not self.rot:
+    def act_q(self, x, Mp=None, nt=256, down=False):
+        if not (self.rot is True or (self.rot == "down" and down)):
             return S.act_quant(x, Mp, nt=nt)
         return S.rot_quant(x, self.signs(x.shape[1]), Mp)
 
@@ -166,7 +167,7 @@ class FusedQwen3:
             h = S.mm_epi(xq, W(wo, so.size, hq * d), xs, so, 2, dtype, res=h, tile=T["o"])
             xq, xs = self.rms_q(h, pn)
             act = S.mm_epi(xq, W(wgu, sgu.size, D), xs, sgu, 3, dtype, tile=T["gu"])
-            xq, xs = self.act_q(act, nt=512)
+            xq, xs = self.act_q(act, nt=512, down=True)
             h = S.mm_epi(xq, W(wd, sd.size, sgu.size // 2), xs, sd, 2, dtype, res=h, tile=T["down"])
             xq, xs = self.rms_q(h, nn)
             return h, xq, xs
@@ -227,7 +228,7 @@ class FusedQwen3:
             w_gu = ws["gu"].unpack()
             self._rec(i, "gu", h, xq, w_gu, None)
             act = S.mm_epi(xq, w_gu, xs, ws["gu"].wscale, 3, h.dtype, tile=T["gu"])
-            xq, xs = self.act_q(act, nt=512)
+            xq, xs = self.act_q(act, nt=512, down=True)
             w_d = ws["down"].unpack()
             self._rec(i, "down", act, xq, w_d, None)
             h = S.mm_epi(xq, w_d, xs, ws["down"].wscale, 2, h.dtype, res=h, tile=T["down"])
@@ -306,16 +307,18 @@ def load_fused(repo, cache_dir, resident=False, overlap=False, epilogue="gemm", 
     import w4a8_mlx as w
     from mlx_lm import load
     model, tok = load(repo)
-    if packed.startswith("rot:"):  # GPTQ weights in the rotated basis (e2e/pack_rot.py), rotated inputs
+    if packed.startswith(("rot:", "rotdown:")):  # GPTQ weights in the rotated basis (e2e/pack_rot.py), rotated inputs
         import pack_format as pf
         import pack_rot as pr
-        cache = pr.cache_path(repo, packed[4:], cache_dir)
-        assert os.path.exists(cache), f"{cache} missing: run e2e/pack_rot.py --repo {repo} --format {packed[4:]}"
+        down = packed.startswith("rotdown:")
+        name = packed.split(":", 1)[1]
+        cache = pr.cache_path(repo, name, cache_dir, down)
+        assert os.path.exists(cache), f"{cache} missing: run e2e/pack_rot.py --repo {repo} --format {name}" + (" --down-only" if down else "")
         flat = mx.load(cache)
         pk = {k[:-6]: (np.array(flat[k]), np.array(flat[k[:-6] + ".bcodes"]), np.array(flat[k[:-6] + ".wscale"]))
               for k in flat if k.endswith(".codes")}
         return FusedQwen3(model, pk, resident=resident, overlap=overlap, epilogue=epilogue, compiled=compiled,
-                          fmt=pf.sc_format_of(packed[4:]), rot=True), tok
+                          fmt=pf.sc_format_of(name), rot="down" if down else True), tok
     if packed.startswith("fmt:"):  # another INT8-exact format of sim/formats.py, packed by e2e/pack_format.py
         import pack_format as pf
         cache = pf.cache_path(repo, packed[4:], cache_dir)

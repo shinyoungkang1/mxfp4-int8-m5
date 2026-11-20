@@ -38,7 +38,8 @@ def load(name, cache_dir, packed="rtn"):
         return f, dec.DecodeQwen3(f), tok
     if name == "qwen35":
         import fused_qwen35 as fz
-        f, tok = fz.load_fused_qwen35(cache_dir=cache_dir)
+        fmt = packed.split(":", 1)[1] if packed.startswith(("fmt:", "rot:")) else None
+        f, tok = fz.load_fused_qwen35(cache_dir=cache_dir, fmt_name=fmt, rot=packed.startswith("rot:"))
         return f, dec.DecodeQwen35(f), tok
     import fused_olmoe as fo
     f, tok = fo.load_fused_olmoe("allenai/OLMoE-1B-7B-0924", cache_dir)
@@ -48,7 +49,7 @@ def load(name, cache_dir, packed="rtn"):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="qwen3", choices=["qwen3", "olmoe", "qwen35"])
-    ap.add_argument("--packed", default="rtn", help="qwen3 only: rtn | gptq | fmt:<sim/formats.py name>")
+    ap.add_argument("--packed", default="rtn", help="qwen3: rtn | gptq | fmt:<sim/formats.py name>; qwen35: rtn (SC-MXFP4) | fmt:<name> | rot:<name>")
     ap.add_argument("--cache-dir", default=os.path.expanduser("~/.cache/mxfp4-int8-m5"))
     ap.add_argument("--prompt", type=int, default=512)
     ap.add_argument("--steps", type=int, default=64)

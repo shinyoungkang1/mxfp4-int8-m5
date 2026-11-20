@@ -18,7 +18,11 @@ import sc_format as F
 
 _GEMV = """
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    const uint n0 = (threadgroup_position_in_grid.x * NSG + sg) * R;
+    // SPLITK > 1: the NSG simdgroups form NSG / SPLITK row groups of R rows, each row group's K split SPLITK ways
+    // (simdgroup ks takes every SPLITK-th lane chunk); the integer partial sums are added in threadgroup memory
+    constexpr uint NRG = NSG / SPLITK;
+    const uint ks = sg / NRG;
+    const uint n0 = (threadgroup_position_in_grid.x * NRG + sg % NRG) * R;
     if (n0 >= N) return;
     constexpr uint WPR = K / 8;                     // code words per row
     constexpr uint BPR = K / (SC_BLOCK * SC_PER_BYTE);
@@ -88,7 +92,7 @@ _GEMV = """
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0;
-    for (uint k0 = VPL * lane; k0 < K; k0 += VPL * 32) {
+    for (uint k0 = VPL * (32 * ks + lane); k0 < K; k0 += VPL * 32 * SPLITK) {
         // VPL activations of this lane as floats (exact integers)
         auto xv = PRO ? (threadgroup const char4 *)(sx + k0) : (threadgroup const char4 *)nullptr;
         auto xd = (device const char4 *)(xq + k0);
@@ -98,14 +102,25 @@ _GEMV = """
             const char4 c4 = PRO ? xv[j] : xd[j];
             xf[4 * j] = c4.x; xf[4 * j + 1] = c4.y; xf[4 * j + 2] = c4.z; xf[4 * j + 3] = c4.w;
         }
+        uint wa[R][WPL];
+        uint bca[R][NB];
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const uint n = n0 + r;
             auto wp = codes + size_t(n) * WPR + k0 / 8;
-            uint wv[WPL];
-            if (WPL == 4) { const uint4 t4 = *(device const uint4 *)wp; wv[0] = t4.x; wv[1] = t4.y; wv[2] = t4.z; wv[3] = t4.w; }
-            else if (WPL == 2) { const uint2 t2 = *(device const uint2 *)wp; wv[0] = t2.x; wv[1] = t2.y; }
-            else { for (uint q = 0; q < WPL; ++q) wv[q] = wp[q]; }
+            if (WPL == 4) { const uint4 t4 = *(device const uint4 *)wp; wa[r][0] = t4.x; wa[r][1] = t4.y; wa[r][2] = t4.z; wa[r][3] = t4.w; }
+            else if (WPL == 2) { const uint2 t2 = *(device const uint2 *)wp; wa[r][0] = t2.x; wa[r][1] = t2.y; }
+            else { for (uint q = 0; q < WPL; ++q) wa[r][q] = wp[q]; }
+#pragma unroll
+            for (uint b = 0; b < NB; ++b) {
+                const uint blk = (k0 + b * SC_BLOCK) / SC_BLOCK;
+                bca[r][b] = (bcodes[size_t(n) * BPR + blk / SC_PER_BYTE] >> (SC_BC_BITS * (blk % SC_PER_BYTE)))
+                            & ((1u << SC_BC_BITS) - 1);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const thread uint *wv = wa[r];
             float bs[NB];
 #pragma unroll
             for (uint b = 0; b < NB; ++b) bs[b] = 0;
@@ -136,17 +151,21 @@ _GEMV = """
                 bs[q / WPB] += sq;
             }
 #pragma unroll
-            for (uint b = 0; b < NB; ++b) {
-                const uint blk = (k0 + b * SC_BLOCK) / SC_BLOCK;
-                const uint bc = (bcodes[size_t(n) * BPR + blk / SC_PER_BYTE] >> (SC_BC_BITS * (blk % SC_PER_BYTE)))
-                                & ((1u << SC_BC_BITS) - 1);
-                acc[r] = fma(bs[b], float(sc_mult(bc)), acc[r]);
-            }
+            for (uint b = 0; b < NB; ++b) acc[r] = fma(bs[b], float(sc_mult(bca[r][b])), acc[r]);
         }
     }
     int tot[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) tot[r] = simd_sum(int(rint(acc[r] * SC_ACC_SCALE)));
+    if (SPLITK > 1) {   // exact: integer partial sums
+        threadgroup int part[SPLITK > 1 ? NSG * R : 1];
+        if (lane == 0)
+            for (int r = 0; r < R; ++r) part[sg * R + r] = tot[r];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (ks != 0) return;
+        for (uint j = 1; j < SPLITK; ++j)
+            for (int r = 0; r < R; ++r) tot[r] += part[(sg + j * NRG) * R + r];
+    }
     if (lane != 0) return;
     float yv[R];
 #pragma unroll
@@ -182,12 +201,12 @@ def _dummy_rows():
     return _dummy_xq[0]
 
 
-GEMV_TILE = (4, 16, 2)  # rows per simdgroup, activations per lane per step, simdgroups per threadgroup
+GEMV_TILE = (4, 16, 2)  # rows per simdgroup, activations per lane per step, simdgroups per threadgroup[, split K]
 GEMV_TILES = {}         # per-shape overrides {(N, K): tile} (e2e/tune_decode.py)
 
 
 def gemv(xq, codes, bcodes, xscale, wscale, N, epi, dtype=mx.bfloat16, res=None, nsg=None, eidx=None, xstride=0,
-         pro=0, nw=None, eps=None, rows=None, vpl=None, shared=None):
+         pro=0, nw=None, eps=None, rows=None, vpl=None, shared=None, splitk=None):
     """W4A8 GEMV. Input: pro=0: xq int8 [K] (or [S, K] with xstride=1) and xscale; pro=1: xq is a T row (or rows),
     quantized per token inside the kernel (act_quant); pro=2: xq is a T row, RMSNorm(nw, eps) + INT8 inside (as
     rmsnorm_quant). Output: EPI 1: T [N]; 2: T [N] = res + y; 3: T [N / 2] (interleaved gate/up rows).
@@ -199,8 +218,10 @@ def gemv(xq, codes, bcodes, xscale, wscale, N, epi, dtype=mx.bfloat16, res=None,
     K = xq.shape[-1]
     t = GEMV_TILES.get((N, K), GEMV_TILE)
     R, V, nsg = rows or t[0], vpl or t[1], nsg or t[2]
+    sk = splitk or (t[3] if len(t) > 3 else 1)
+    nrg = nsg // sk  # row groups per threadgroup
     # lanes stride K in chunks of V (block-aligned); K need not be a multiple of 32 V (Qwen3.8 down: K = 640)
-    assert K % V == 0 and K % 128 == 0 and N % (R * nsg) == 0 and (epi != 3 or R % 4 == 0)
+    assert nsg % sk == 0 and K % V == 0 and K % 128 == 0 and N % (R * nrg) == 0 and (epi != 3 or R % 4 == 0)
     k = S._kernel("gemv", ["xq_all", "codes_all", "bcodes_all", "xscale", "wscale_all", "res", "eidx", "xin", "nw",
                            "eps"], ["out_all"], _GEMV, header_extra=_header)
     no = N // 2 if epi == 3 else N
@@ -211,8 +232,8 @@ def gemv(xq, codes, bcodes, xscale, wscale, N, epi, dtype=mx.bfloat16, res=None,
                     xq if pro else d, nw if pro == 2 else d, eps if pro == 2 else S._dummy(mx.float32)],
             template=[("T", dtype), ("EPI", epi), ("N", N), ("K", K), ("NSG", nsg), ("R", R), ("VPL", V),
                       ("GATHER", eidx is not None), ("XSTRIDE", xstride), ("PRO", pro),
-                      ("SHARED", -1 if shared is None else int(shared)), ("NSLOT", nslot)],
-            grid=(N // (R * nsg) * 32 * nsg, S_, 1), threadgroup=(32 * nsg, 1, 1),
+                      ("SHARED", -1 if shared is None else int(shared)), ("NSLOT", nslot), ("SPLITK", sk)],
+            grid=(N // (R * nrg) * 32 * nsg, S_, 1), threadgroup=(32 * nsg, 1, 1),
             output_shapes=[(S_ * no,)], output_dtypes=[dtype])[0]
     return out if eidx is None else out.reshape(S_, no)
 

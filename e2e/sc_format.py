@@ -29,6 +29,7 @@ class Format:
     code_mag: tuple = (0, 1, 2, 3, 4, 6, 8, 12)
     mult: tuple = (1, 2, 4, 8)
     bc_bits: int = 2
+    inline_mult: bool = False  # MULT = 1..n: sc_mult(i) = i + 1 as ALU code instead of a constant table (same values)
 
     def __post_init__(self):
         assert self.block % 8 == 0, "a thread decodes 8 consecutive codes, which must share a block"
@@ -50,8 +51,13 @@ class Format:
                 return f"inline int {name}(uint i) {{ return int((0x{word:08X}u >> (4 * i)) & 0xFu); }}\n"
             arr = ", ".join(str(v) for v in vals)
             return f"constant int {name}_T[{len(vals)}] = {{{arr}}};\ninline int {name}(uint i) {{ return {name}_T[i]; }}\n"
+        if self.inline_mult:
+            assert tuple(self.mult) == tuple(range(1, len(self.mult) + 1)), "inline_mult needs MULT = 1..n"
+            mult = "inline int sc_mult(uint i) { return int(i) + 1; }\n"
+        else:
+            mult = table("sc_mult", self.mult)
         return (f"#define SC_BLOCK {self.block}\n#define SC_BC_BITS {self.bc_bits}\n#define SC_PER_BYTE {self.per_byte}\n"
-                + table("sc_mag", self.code_mag) + table("sc_mult", self.mult))
+                + table("sc_mag", self.code_mag) + mult)
 
 
 DEFAULT = Format()

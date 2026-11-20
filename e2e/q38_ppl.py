@@ -15,7 +15,12 @@ projections, n-gram table (FP8, a lookup), embeddings, lm_head.
 
 Methods: names or specs of sim/eval_ppl.py ("sc_mxfp4_w4a8", "w=fmt:e2m1/B16/M1..10;a=8", "nvfp4_w4a16", ...);
 "fp8" is the unquantized checkpoint; a spec may add ";s=experts" to quantize only the routed experts (the scope of
-the public NVFP4 / FP8 recipes for this model).
+the public NVFP4 / FP8 recipes for this model; every other matrix then keeps its weights and its float inputs).
+"wd=<kind|bf16>" gives the dense projections (DeltaNet / attention) a weight kind of their own, "ws=<kind|bf16>" the
+shared expert; without them both take w. Activations (a) apply at every W4A8 site, whatever its weights. Examples:
+"w=sc_mx;a=8;wd=fmt:e2m1/B8/M1..10", "w=fmt:e2m1/B16/M1..10;a=8;wd=int8_row" (8-bit dense projections),
+"w=sc_mx;a=8;wd=bf16" (the experts' weights only, INT8 activations everywhere).
+<out>.prov.jsonl gets one line of provenance per run (sim/provenance.py).
 Usage (.venv-q38): python q38_ppl.py --methods fp8,sc_mxfp4_w4a8,... --out ../results/10_ppl_qwen38.csv
                    [--windows N] [--layers N (debug: stop after N layers, report nothing)]
 """
@@ -36,6 +41,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "sim"))
 import eval_ppl as E  # noqa: E402
 import formats as F  # noqa: E402
+import provenance as prov  # noqa: E402
 import q38_ckpt as C  # noqa: E402
 from gpu_guard import eval_step  # noqa: E402
 from mlx_lm.models import qwen4_exp  # noqa: E402
@@ -47,16 +53,21 @@ EXPERTS = ["mlp.switch_mlp.gate_proj", "mlp.switch_mlp.up_proj", "mlp.switch_mlp
 
 
 def parse(m):
-    """-> (weight kind or None, INT8 activations, scope). Specs may add ";s=experts" to quantize only the routed
-    experts (the scope of the public NVFP4 / FP8 recipes for this model); default scope: the whole W4A8 set."""
+    """-> (weight kind of the routed experts or None, INT8 activations, scope, weight kind of the dense projections,
+    weight kind of the shared expert). Specs may add ";s=experts" to quantize only the routed experts (the scope of
+    the public NVFP4 / FP8 recipes for this model); default scope: the whole W4A8 set. ";wd=" / ";ws=" give the dense
+    projections / the shared expert a kind of their own (eval_ppl.parse_scoped); without them they take w."""
     if m == "fp8":
-        return None, False, "all"
+        return None, False, "all", None, None
     kv = dict(part.split("=", 1) for part in m.split(";")) if "=" in m else {}
     scope = kv.pop("s", "all")
     assert scope in ("all", "experts"), scope
-    wk, a8, had = E.parse_method(";".join(f"{k}={v}" for k, v in kv.items()) if kv else m)
+    wk, a8, had, wd, ws = E.parse_scoped(";".join(f"{k}={v}" for k, v in kv.items()) if kv else m)
     assert not had, "rotations are not supported here"
-    return wk, a8, scope
+    assert scope == "all" or (wd == wk and ws == wk), "s=experts leaves every other matrix as it is: no wd / ws with it"
+    for k in (wk, wd, ws):
+        E.check_kind(k, gptq=False)
+    return wk, a8, scope, wd, ws
 
 
 def _fake(args):
@@ -180,7 +191,7 @@ def main():
     rope = qwen4_exp.RotaryEmbedding(int(args.head_dim * args.partial_rotary_factor), args.rope_theta)
     eos = args.eos_token_id[0] if isinstance(args.eos_token_id, list) else args.eos_token_id
     prev_ctx = mx.full((a.batch, args.ngram_size - 1), eos, X.dtype)
-    kinds = sorted({wk for wk, _, _ in parsed.values() if wk})
+    kinds = sorted({p[0] for p in parsed.values() if p[0]})
     t_start = time.time()
     guard = C.MemoryGuard()
     with ProcessPoolExecutor(a.workers) as pool:
@@ -190,6 +201,8 @@ def main():
                 layer = load_layer(ck, args, i)
                 paths = DENSE[layer.layer_type] + SHARED + EXPERTS
                 orig = {p: get_mod(layer, p) for p in paths}
+                small = [p for p in paths if p not in EXPERTS]
+                own = {}  # kind -> the dense projections and the shared expert in a kind other than the experts' (wd=, ws=)
                 t1 = time.time()
                 tq = 0.0
                 for kind in [None] + kinds:  # one fake-quantized copy of the layer at a time (peak memory)
@@ -200,10 +213,20 @@ def main():
                     fakes = fake_all({p: orig[p].weight for p in paths}, kind, pool) if kind else None
                     tq += time.time() - tk
                     for m in ms:
-                        wk, a8, scope = parsed[m]
+                        wk, a8, scope, wd, ws = parsed[m]
                         for p in paths:
-                            if (wk or a8) and (scope == "all" or p in EXPERTS):
-                                w = fakes[p] if wk else orig[p].weight
+                            k = wk if p in EXPERTS else ws if p in SHARED else wd
+                            if (k or a8) and (scope == "all" or p in EXPERTS):
+                                if not k:
+                                    w = orig[p].weight
+                                elif k == wk:
+                                    w = fakes[p]
+                                else:
+                                    if k not in own:
+                                        tk = time.time()
+                                        own[k] = fake_all({s: orig[s].weight for s in small}, k, pool)
+                                        tq += time.time() - tk
+                                    w = own[k][p]
                                 set_mod(layer, p, FQSwitch(w, a8) if p in EXPERTS else FQLinear(w, a8))
                             else:
                                 set_mod(layer, p, orig[p])
@@ -217,7 +240,7 @@ def main():
                     del fakes
                     mx.clear_cache()
                 t2 = t1 + tq
-                del layer, orig
+                del layer, orig, own
                 mx.clear_cache()
             print(f"layer {i} ({'DeltaNet' if i % 4 != 3 else 'attention'}): load {t1 - t0:.0f} s, quantize "
                   f"{t2 - t1:.0f} s, forward {time.time() - t2:.0f} s; total {(time.time() - t_start) / 60:.1f} min; "
@@ -271,6 +294,8 @@ def main():
             if new:
                 wr.writeheader()
             wr.writerows(rows)
+        prov.sidecar(a.out, model=C.REPO, methods=methods, windows=n, seq=a.seq,
+                     deltanet="kernel" if a.deltanet_kernel else "reference")
         print("appended to", a.out)
         # per-window summed NLLs, for paired bootstrap confidence intervals between methods
         np.savez(os.path.splitext(a.out)[0] + f"_windows_{int(time.time())}.npz",

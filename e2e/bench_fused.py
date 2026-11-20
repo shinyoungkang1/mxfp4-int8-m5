@@ -10,6 +10,8 @@ Methods:
   fused_row                        same kernels but INT32 GEMM outputs and row-wise epilogue kernels
   fused_row_overlap                fused_row with each unpack ordered next to an independent GEMM (ablation)
   fused_res                        fused with INT8 weights kept resident (8 bits/weight; ceiling without unpack)
+  fused_b16, fused_b8              fused, weights in the 16-wide / 8-wide format (e2e/pack_format.py e2m1/B16|B8/M1..10);
+                                   each model installs its format at every call, so formats alternate safely (bench_format.py)
 
 Usage: python bench_fused.py [--lengths 512,2048,8192] [--reps 10] [--methods ...] [--out results/07_prefill.csv]
 """
@@ -60,6 +62,8 @@ def loaders(repo, cache_dir):
         "fused_row": lambda: Fused(fq.load_fused(repo, cache_dir, epilogue="row")[0]),
         "fused_row_overlap": lambda: Fused(fq.load_fused(repo, cache_dir, epilogue="row", overlap=True)[0]),
         "fused_res": lambda: Fused(fq.load_fused(repo, cache_dir, resident=True)[0]),
+        "fused_b16": lambda: Fused(fq.load_fused(repo, cache_dir, packed="fmt:e2m1/B16/M1..10")[0]),
+        "fused_b8": lambda: Fused(fq.load_fused(repo, cache_dir, packed="fmt:e2m1/B8/M1..10")[0]),
         "no_linears": lambda: Plain(bp.strip_linears(load(repo)[0])),
     }
 
@@ -117,11 +121,12 @@ def main():
     print("#", state)
     if a.out:
         with open(a.out, "w", newline="") as f:
-            f.write(f"# {state}\n")
+            f.write(bp.prov.csv_head(state))
             wr = csv.DictWriter(f, fieldnames=["model", "regime"] + list(rows[0]))
             wr.writeheader()
             for r in rows:
                 wr.writerow(dict(model=a.repo, regime=a.regime, **r))
+        bp.prov.sidecar(a.out, fresh=True, power=state, model=a.repo, methods=list(models), regime=a.regime)
         print("wrote", a.out)
 
 

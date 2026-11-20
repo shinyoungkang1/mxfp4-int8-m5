@@ -8,6 +8,8 @@ and one assistant turn "<solution> #### <n>" per shot; with plain completion thi
 once). Generation stops as lm-eval's gsm8k task does (at "Question:", "<|im_end|>" or the end-of-sequence token) or
 after --max-tokens. Scoring: lm-eval's strict-match ("#### <n>") and flexible-extract (last number) regexes.
 Usage (.venv-q38): python gsm8k_q38.py --system fused --n 500 --out ../results/10_gsm8k_fused.jsonl
+The output has one line per example and is resumable; <out>.prov.jsonl gets one line of provenance per run
+(sim/provenance.py), so a file finished over several runs lists each of them.
 """
 import argparse
 import json
@@ -23,6 +25,8 @@ from huggingface_hub import hf_hub_download
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "sim"))
+import provenance as prov  # noqa: E402
 import q38_ckpt as C  # noqa: E402
 
 STRICT = re.compile(r"#### (\-?[0-9\.\,]+)")
@@ -94,6 +98,13 @@ def main():
             done[r["i"]] = r
     fmt = {"fused": None, "fused_b16": "e2m1/B16/M1..10"}
     sysm = Fused(fmt[a.system], a.layers or None) if a.system in fmt else Mlx(a.system, a.layers or None)
+    what = {}
+    if a.system in fmt:
+        import fused_qwen38 as FQ
+        what = dict(format=fmt[a.system] or "scmxfp4",
+                    pack=FQ.pack_dir(fmt[a.system] or FQ.SC, os.path.expanduser("~/.cache/mxfp4-int8-m5")))
+    prov.sidecar(a.out, model=C.REPO, system=a.system, n=a.n, max_tokens=a.max_tokens, layers=a.layers or None,
+                 already_done=len(done), **what)
     t_all, n_tok = time.time(), 0
     with open(a.out, "a") as fh:
         for i, ex in enumerate(test[:a.n]):

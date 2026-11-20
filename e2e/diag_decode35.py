@@ -196,7 +196,7 @@ def main():
     mxm = load(os.path.join(CACHE, fz.REPO.split("/")[-1] + "-mxfp4"))[0]
     f, _ = fz.load_fused_qwen35()
     f.two_pass = "auto"
-    d = dec.DecodeQwen35(f, head=mxm)
+    d = dec.DecodeQwen35(f, head=mxm, out_prologue=False, out_tile=None)  # the run-08 default
     d_nc = dec.DecodeQwen35(f, head=mxm, compiled=False)
     d_old = dec.DecodeQwen35(f, head=mxm, lean=False)
     d_op = dec.DecodeQwen35(f, head=mxm, out_prologue=True)

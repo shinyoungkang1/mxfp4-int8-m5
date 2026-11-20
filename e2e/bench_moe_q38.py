@@ -288,10 +288,11 @@ def main():
     print("#", state)
     if a.out:
         with open(a.out, "w", newline="") as f:
-            f.write(f"# {state}; skew {a.skew}\n")
+            f.write(bp.prov.csv_head(f"{state}; skew {a.skew}"))
             wr = csv.DictWriter(f, fieldnames=list(rows[0]))
             wr.writeheader()
             wr.writerows(rows)
+        bp.prov.sidecar(a.out, fresh=True, power=state, skew=a.skew)
         print("wrote", a.out)
 
 

@@ -68,6 +68,8 @@ def main():
     ref_method = {"rtn": "sc_mxfp4_w4a8", "gptq": "w=gptq:sc_mx;a=8"}.get(a.packed, f"w={a.packed};a=8")
     if a.packed.startswith("rot:"):
         ref_method = f"w=gptq:{a.packed[4:]};a=8;r=32"
+    if a.packed.startswith("rotdown:"):
+        ref_method = f"w=gptq:{a.packed[8:]};a=8;r=32;rp=mlp.down_proj"
     rep["reference_method"] = ref_method
     eval_ppl.quantize_model(ref, ref_method, a.repo)
     S.set_format(fused.fmt)
@@ -117,7 +119,7 @@ def main():
             acc = S.mm_i8_i32(xq, wq)
         acc_np = np.array(acc[:L]).astype(np.float64)
         acc_ref = np.array(xq[:L]).astype(np.float64) @ np.array(wq).astype(np.float64).T
-        if fused.rot:  # the reference's rotation, a float32 matmul (the kernel's butterflies can round differently before BF16)
+        if fused.rot is True or (fused.rot == "down" and g == "down"):  # the reference's rotation, a float32 matmul (the kernel's butterflies can round differently before BF16)
             sh = xr.shape
             hb = mx.array(eval_ppl.hadamard(32).astype(np.float32))
             xr = ((xr.astype(mx.float32) * fused.signs(sh[1])).reshape(sh[0], -1, 32) @ hb).reshape(sh).astype(xr.dtype)

@@ -68,7 +68,9 @@ def main():
             wr.writerow(["model", "method", "seq", "chunks", "ppl", "seconds"])
         for m in a.methods.split(","):
             t0 = time.time()
-            if m.startswith("ours_rot:"):
+            if m.startswith("ours_rotdown:"):
+                model, tok = fq.load_fused(REPO, CACHE, packed="rotdown:" + m[len("ours_rotdown:"):])
+            elif m.startswith("ours_rot:"):
                 model, tok = fq.load_fused(REPO, CACHE, packed="rot:" + m[len("ours_rot:"):])
             elif m.startswith("ours_fmt:"):
                 model, tok = fq.load_fused(REPO, CACHE, packed="fmt:" + m[len("ours_fmt:"):])

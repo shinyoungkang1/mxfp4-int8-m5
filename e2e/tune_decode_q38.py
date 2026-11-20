@@ -34,6 +34,11 @@ CONFIGS = {
 }
 
 
+# dense projections: qkvz / qkv with the in-kernel INT8 prologue at 8 simdgroups per threadgroup, the 2560 x 6144
+# output projections with a separate act_quant kernel (micro-benchmarks 2026-11-18, SC-MXFP4)
+TUNED = {"qkvz": (4, 16, 8, 1), "o": "sep"}
+
+
 class Skip:
     """Context: replace the expert GEMVs (moe) and/or the dense GEMVs by zeros of the right shape."""
 
@@ -46,7 +51,7 @@ class Skip:
         if self.moe:
             d._moe = lambda x, *a: mx.zeros_like(x)
         if self.dense:
-            d._gemv = lambda x, pw: mx.zeros((pw.N,), x.dtype)
+            d._gemv = lambda x, pw, *_: mx.zeros((pw.N,), x.dtype)
         return self
 
     def __exit__(self, *e):
@@ -74,6 +79,8 @@ def main():
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--configs", default=",".join(CONFIGS))
     ap.add_argument("--dense-only", action="store_true", help="only compare dense='ours' vs dense='mlx' decode")
+    ap.add_argument("--dense-tuned", action="store_true", help="only compare dense='mlx' (SC-MXFP4), 'ours' and 'ours' "
+                    "with TUNED dense tiles (logits of the two 'ours' checked equal first)")
     ap.add_argument("--format", default=FQ.SC, help="packed format: sc or a sim/formats.py name (e2m1/B16/M1..10)")
     ap.add_argument("--breakdown-only", action="store_true", help="skip the tile sweep")
     ap.add_argument("--old-layout", action="store_true", help="restore the strided gate|up bcodes / wscale of runs before "
@@ -90,6 +97,38 @@ def main():
     x0 = f.layers[0][3]["gu"]
     print("# gate|up strides: bcodes", np.array(x0[1], copy=False).strides, "wscale", np.array(x0[2], copy=False).strides)
     prompt = mx.array(np.random.default_rng(0).integers(0, 248320, (1, 512)).astype(np.int32))
+    if a.dense_tuned:
+        modes = {"ours": dict(dense="ours", dense_tiles={}), "ours_tuned": dict(dense="ours", dense_tiles=TUNED)}
+        if f.fmt == FQ.F.Format():
+            modes = {"mlx": dict(dense="mlx"), **modes}
+        lg = {}
+        for name in ("ours", "ours_tuned"):
+            d = FQ.DecodeQwen38(f, **modes[name])
+            cache = f.make_cache()
+            tok = mx.argmax(f.logits(f.hidden(prompt[:, :64], cache)[:, -1:])[:, -1], axis=-1)[:, None]
+            out = []
+            for _ in range(16):
+                logits = d.step(tok, cache)
+                mx.eval(logits)
+                out.append(np.array(logits.astype(mx.float32)))
+                tok = mx.argmax(logits[:, -1], axis=-1)[:, None]
+            lg[name] = np.stack(out)
+        same = bool(np.array_equal(lg["ours"], lg["ours_tuned"]))
+        print(f"# tuned dense tiles {TUNED}: logits over 16 steps identical to the default tiles: {same}", flush=True)
+        if not same:
+            raise SystemExit("tuned dense tiles changed the logits")
+        ds = {name: FQ.DecodeQwen38(f, **kw) for name, kw in modes.items()}
+        for _ in range(2):  # two full untimed passes per arm: the first sessions ran slower (pages of the 66 GB pack)
+            for d in ds.values():
+                ms_per_step(f, d, prompt, a.tokens)
+        res = {}
+        for r in range(a.reps):  # rotate the order
+            names = list(ds)[r % len(ds):] + list(ds)[:r % len(ds)]
+            for name in names:
+                res.setdefault(name, []).append(ms_per_step(f, ds[name], prompt, a.tokens))
+        for name, v in res.items():
+            print(f"dense={name:10s} {1e3 / np.median(v):6.1f} tok/s  ({np.median(v):.2f} ms/step; {[round(x, 2) for x in v]})")
+        return
     if a.dense_only:
         print("## dense projections: our W4A8 GEMV vs MLX's MXFP4 GEMV on the same packed bytes (experts: ours)")
         res = {}

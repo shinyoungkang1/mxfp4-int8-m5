@@ -2,7 +2,8 @@
 "w=gptq:<format>;a=8;r=32" computes for every block linear, stored as codes, block codes and row scales. Checks per matrix: the
 packed layout decodes to the INT8 operands exactly, and they times the row base equal the GPTQ output in float32.
 
-Usage: python pack_rot.py [--repo Qwen/Qwen3-1.7B-Base] [--format e2m1/B8/M1..10] [--workers 8] [--out results/25_pack.json]
+Usage: python pack_rot.py [--repo Qwen/Qwen3-1.7B-Base] [--format e2m1/B8/M1..10] [--workers 8] [--out results/25_pack.json] [--down-only]
+--down-only rotates only mlp.down_proj, as "w=gptq:<format>;a=8;r=32;rp=mlp.down_proj" does; the other matrices are GPTQ in the plain basis.
 python pack_rot.py --self-test   checks the rotation kernel against a NumPy reference, bit for bit.
 Writes ~/.cache/mxfp4-int8-m5/<repo>-fmt-<slug>-gptq-rot32.safetensors.
 """
@@ -21,9 +22,9 @@ sys.path.insert(0, os.path.join(HERE, "..", "sim"))
 BLOCK = 32
 
 
-def cache_path(repo, name, cache_dir):
+def cache_path(repo, name, cache_dir, down_only=False):
     import pack_format as pf
-    return os.path.join(cache_dir, repo.replace("/", "--") + f"-fmt-{pf.slug(name)}-gptq-rot32.safetensors")
+    return os.path.join(cache_dir, repo.replace("/", "--") + f"-fmt-{pf.slug(name)}-gptq-{'rotdown32' if down_only else 'rot32'}.safetensors")
 
 
 def rotate(w, h):
@@ -42,11 +43,15 @@ def one(args):
     import formats as FF
     import gptq as G
     import pack_format as pf
-    key, w32, hpath, name = args
+    key, w32, hpath, name, rotated = args
     t0 = time.time()
     fmt = pf.sc_format_of(name)
     f = FF.FORMATS[name]
-    w, h = rotate(np.asarray(w32, np.float64), np.load(hpath))
+    w, h = np.asarray(w32, np.float64), np.load(hpath)
+    if rotated:
+        w, h = rotate(w, h)
+    else:
+        h = h.astype(np.float64)
     # as eval_ppl.fake_weight: scales from the format's quantizer on the rotated weights, then GPTQ on its codebook
     _, _, base, scales = FF.quantize_mx(w, f)
     wg = G.gptq(w, h, scales, FF.CODEBOOKS[f.codebook])
@@ -111,6 +116,7 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--cache-dir", default=os.path.expanduser("~/.cache/mxfp4-int8-m5"))
     ap.add_argument("--out", default="")
+    ap.add_argument("--down-only", action="store_true")
     a = ap.parse_args()
     model, _ = load(a.repo)
     jobs = []
@@ -120,7 +126,7 @@ def main():
             for p in path.split("."):
                 lin = getattr(lin, p)
             hp = os.path.join(calib.cache_dir(a.repo), f"{i}_{calib.LINEAR_TO_GROUP[path]}.npy")
-            jobs.append((f"layers.{i}.{path}", np.array(lin.weight.astype(mx.float32)), hp, a.format))
+            jobs.append((f"layers.{i}.{path}", np.array(lin.weight.astype(mx.float32)), hp, a.format, not a.down_only or path == "mlp.down_proj"))
     flat, stats = {}, {}
     with ProcessPoolExecutor(a.workers) as ex:
         for n, (key, c, b, s, st) in enumerate(ex.map(one, jobs)):
@@ -128,7 +134,7 @@ def main():
             stats[key] = st
             print(f"\rpacked {n + 1}/{len(jobs)}", end="", flush=True)
     print()
-    path = cache_path(a.repo, a.format, a.cache_dir)
+    path = cache_path(a.repo, a.format, a.cache_dir, a.down_only)
     mx.save_safetensors(path, flat)
     rep = {"format": a.format, "matrices": len(stats), "all_q_exact": all(v["exact_q"] for v in stats.values()),
            "all_w_exact": all(v["exact_w"] for v in stats.values()), "cache": path}

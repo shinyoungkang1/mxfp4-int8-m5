@@ -38,26 +38,42 @@ def _fake_kind(args):
     return _fake(*args)
 
 
-def build_fake(model, wkind, act8, workers=14):
-    """Fake-quantizes (sim/eval_ppl.fake_weight `wkind`) the same matrices that the fused model runs in W4A8, with
-    per-token INT8 activations if act8 (eval_ppl.METHODS semantics), in place."""
+SAME = "same"
+
+
+def build_fake(model, wkind, act8, workers=14, had=0, rot_only=None, dense=SAME, shared=SAME):
+    """Fake-quantizes (sim/eval_ppl.fake_weight `wkind`, None keeps BF16) the same matrices that the fused model runs in W4A8, with
+    per-token INT8 activations if act8 (eval_ppl.METHODS semantics), in place. had > 0 rotates the input of each of these matrices in blocks of
+    that size, as eval_ppl.QLinear does; rot_only="down_proj" rotates only the expert and shared-expert down projections.
+    `wkind` is the kind of the routed experts. The dense projections (`dense`) and the shared expert (`shared`) take
+    the same kind unless they are given one of their own (None = BF16 weights); act8 applies to the input of every
+    one of these matrices, whatever its weights."""
+    dense = wkind if dense == SAME else dense
+    shared = wkind if shared == SAME else shared
+    label = str(wkind) if dense == wkind and shared == wkind else f"experts {wkind}, dense {dense}, shared {shared}:"
     layers = model.language_model.model.layers
     with ProcessPoolExecutor(workers) as ex:
         for i, layer in enumerate(layers):
             for paths in fz.DENSE[fz.layer_kind(layer)].values():
                 for p in paths:
                     parent, name = p.rsplit(".", 1)
-                    setattr(fz.get(layer, parent), name, eval_ppl.QLinear(fz.get(layer, p), wkind, act8, 0))
+                    setattr(fz.get(layer, parent), name, eval_ppl.QLinear(fz.get(layer, p), dense, act8, had if rot_only is None else 0))
             for name in fz.EXPERTS:
                 w = getattr(layer.mlp.switch_mlp, name).weight
-                ws = list(np.array(w.astype(mx.float32)))
-                fake = np.stack(list(ex.map(_fake_kind, [(x, wkind) for x in ws], chunksize=8)))
-                setattr(layer.mlp.switch_mlp, name, RefSwitchLinear(mx.array(fake).astype(w.dtype), act8))
+                b = had if rot_only in (None, name) else 0
+                ws = np.array(w.astype(mx.float32))
+                signs = None
+                if b:
+                    signs = np.random.default_rng(0).choice([-1.0, 1.0], size=ws.shape[2])
+                    e, n, k = ws.shape
+                    ws = ((ws.astype(np.float64) * signs).reshape(e, n, -1, b) @ eval_ppl.hadamard(b)).reshape(e, n, k).astype(np.float32)
+                fake = np.stack(list(ex.map(_fake_kind, [(x, wkind) for x in ws], chunksize=8))) if wkind else ws
+                setattr(layer.mlp.switch_mlp, name, RefSwitchLinear(mx.array(fake).astype(w.dtype), act8, b, signs))
                 setattr(layer.mlp.shared_expert, name,
-                        eval_ppl.QLinear(getattr(layer.mlp.shared_expert, name), wkind, act8, 0))
+                        eval_ppl.QLinear(getattr(layer.mlp.shared_expert, name), shared, act8, b))
                 del fake, ws
             mx.eval(layer.parameters())
-            print(f"\r{wkind} layer {i + 1}/{len(layers)}", end="", flush=True)
+            print(f"\r{label} layer {i + 1}/{len(layers)}", end="", flush=True)
     print()
 
 
@@ -74,12 +90,21 @@ def set_act8(model, act8):
 class RefSwitchLinear(nn.Module):
     """eval_ppl.QSwitchLinear with precomputed fake-quantized expert weights."""
 
-    def __init__(self, weight, act8=True):
+    def __init__(self, weight, act8=True, had=0, signs=None):
         super().__init__()
         self.weight = weight
         self.act8 = act8
+        self.had = had
+        if had:
+            self.signs = mx.array(signs.astype(np.float32))
+            self.hb = mx.array(eval_ppl.hadamard(had).astype(np.float32))
 
     def __call__(self, x, indices, sorted_indices=False):
+        if self.had:
+            dt = x.dtype
+            xf = x.astype(mx.float32) * self.signs
+            sh = xf.shape
+            x = (xf.reshape(*sh[:-1], -1, self.had) @ self.hb).reshape(sh).astype(dt)
         if self.act8:
             x = eval_ppl.act_int8(x)
         return mx.gather_mm(x, self.weight.swapaxes(-1, -2), rhs_indices=indices, sorted_indices=sorted_indices)

@@ -334,19 +334,28 @@ def mxfp4_scales(pw, fmt):
     return mx.array(np.ascontiguousarray((ei + 127).astype(np.uint8)))
 
 
+# qkvz / qkv: in-kernel INT8 prologue at 8 simdgroups per threadgroup; 2560 x 6144 output projections: separate act_quant
+TUNED_DENSE = {"qkvz": (4, 16, 8, 1), "o": "sep"}
+
+
 class DecodeQwen38:
     """Batch-1 decode from a FusedQwen38: W4A8 GEMVs on the packed weights (sc_decode.gemv, per-token INT8 inside
     the kernel), the expert GEMVs gather the 10 routed experts and the shared expert (11 slots) themselves; routing
     and combine as the prefill path (PR ops); DeltaNet / attention / PLE / hyper-connections are the PR's code with
     the projections swapped (as FusedQwen38.block)."""
 
-    def __init__(self, fused, compiled=True, dense="mlx"):
+    def __init__(self, fused, compiled=True, dense="mlx", dense_tiles=TUNED_DENSE):
         """dense="mlx": the dense projections (DeltaNet / attention) decode with MLX's MXFP4 GEMV reading our packed
-        bytes unchanged (SC-MXFP4 files are standard MXFP4; 1.4-2.2x faster than our GEMV at these shapes, W4A16);
-        dense="ours": our W4A8 GEMV. The experts always use our gather GEMV (faster than MLX's gather_qmm here)."""
+        bytes unchanged (SC-MXFP4 files are standard MXFP4; 2% faster than our tuned GEMV per step, W4A16);
+        dense="ours": our W4A8 GEMV. The experts always use our gather GEMV (faster than MLX's gather_qmm here).
+        dense_tiles (dense="ours"): {"qkvz": t, "o": t} with t a GEMV tile (rows, values per lane, simdgroups, split K)
+        for the in-kernel INT8 prologue, or "sep" for a separate act_quant kernel; {}: the default tile for both
+        (256+ threadgroups each re-quantize the row). Outputs are identical either way. TUNED_DENSE (default):
+        SC-MXFP4 step 25.09 -> 24.32 ms, MLX's dense GEMV 23.85 ms (results/46_dense_q38_sc.txt)."""
         import sc_decode as G
         self.f, self.G = fused, G
         self.dense = dense if fused.fmt == F.Format() else "ours"
+        self.dense_tiles = dense_tiles or {}
         self._mx = {}
         if self.dense == "mlx":
             for _, _, ws, _, _ in fused.layers:
@@ -370,11 +379,16 @@ class DecodeQwen38:
 
         self._moe = mx.compile(moe) if compiled else moe
 
-    def _gemv(self, x, pw):
+    def _gemv(self, x, pw, which):
         if self.dense == "mlx":
             codes, scales = self._mx[id(pw)]
             return mx.quantized_matmul(x[None], codes, scales, transpose=True, group_size=32, bits=4, mode="mxfp4")[0]
-        return self.G.gemv(x, pw.codes, pw.bcodes, None, pw.wscale, pw.N, 1, pro=1)
+        t = self.dense_tiles.get(which)
+        if t == "sep":
+            xq, xs = S.act_quant(x[None], 1)  # x: one row [K]
+            return self.G.gemv(xq, pw.codes, pw.bcodes, xs, pw.wscale, pw.N, 1)
+        tk = {} if t is None else dict(zip(("rows", "vpl", "nsg", "splitk"), t))
+        return self.G.gemv(x, pw.codes, pw.bcodes, None, pw.wscale, pw.N, 1, pro=1, **tk)
 
     def step(self, tok, cache):
         """tok [1, 1] -> logits [1, 1, V]; cache from FusedQwen38.make_cache (shared with the prefill path)."""
@@ -391,7 +405,7 @@ class DecodeQwen38:
             if layer.ple is not None:
                 h = h + layer.ple(h, tok, prev_ctx, c)
             x, hyper, inject = layer.attn_hyper_connection(h)
-            y = self._gemv(x[0, 0], ws["qkvz"])
+            y = self._gemv(x[0, 0], ws["qkvz"], "qkvz")
             o0 = 0
             for p, n in zip(DENSE[kind]["qkvz"], ws["qkvz"].splits):
                 stubs[p].y = y[o0:o0 + n][None, None]
@@ -400,7 +414,7 @@ class DecodeQwen38:
                 o = layer.linear_attn(x, None, c)
             else:
                 o = layer.self_attn(x, f.rope, None, c, c.indexer)
-            x = self._gemv(o[0, 0], ws["o"])[None, None]
+            x = self._gemv(o[0, 0], ws["o"], "o")[None, None]
             h = hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
             x, hyper, inject = layer.mlp_hyper_connection(h)
             x = self._moe(x[0], layer.mlp.gate.weight, layer.mlp.shared_expert_gate.weight, *ex["gu"], *ex["down"])

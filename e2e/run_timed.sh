@@ -9,15 +9,24 @@
 #  3. after the run (lock still held, so this project's evaluations cannot start) sample again, the lowest of 5 samples
 #     over 10 s (the counter lags our own last kernels by a few seconds): above AFTER_MAX means another client is
 #     using the GPU, the run is rejected (log kept as <log>.rejected-N) and retried;
-#  4. if $VALIDATE is set, it is run afterwards (e.g. anchor_check.py on the CSV) and a failure also rejects the run.
+#  4. the run is validated afterwards and a failure also rejects it. By default every CSV the command names with
+#     "--out <file>.csv" goes through anchor_check.py (MLX MXFP4's own time against its clean reference for that model;
+#     a model without a reference is reported and passes). VALIDATE="cmd" replaces that check, VALIDATE="" turns it off.
+#  5. PAUSE_S seconds (default 300) of idle time pass under the lock before every timing process, so that each one
+#     starts from the same clock state (PAUSE_S=0 for smoke tests).
+# A rejected run leaves no result behind: its log becomes <log>.rejected-N and its CSVs <csv>.rejected-N
+# (with their provenance files, <csv>.rejected-N.prov.jsonl).
 # The utilization samples are appended to the log as '# gpu_util_before=.. after=..'.
 #
-# Usage: [VALIDATE="cmd"] run_timed.sh <log-file> <command> [args...]
+# Usage: [VALIDATE="cmd"] [PAUSE_S=300] run_timed.sh <log-file> <command> [args...]
 set -e
 root="${0:A:h:h}"
 log=$1; shift
 IDLE_MAX=${IDLE_MAX:-6}; SETTLE_S=${SETTLE_S:-20}; RETRY_S=${RETRY_S:-240}; AFTER_MAX=${AFTER_MAX:-15}
-MAX_TRIES=${MAX_TRIES:-8}
+MAX_TRIES=${MAX_TRIES:-8}; PAUSE_S=${PAUSE_S:-300}
+# CSVs the command writes (also inside a quoted "a --out x.csv && b --out y.csv")
+outs=($(print -r -- "$*" | grep -oE -- '--out[ =][^ ;&|"]+\.csv' | sed -E 's/^--out[ =]//' || true))
+apy="$root/.venv/bin/python"; [ -x "$apy" ] || apy=python3
 AVOID=${AVOID:-}   # pgrep -f pattern of other GPU-heavy applications to wait out (e.g. a game); empty: none
 try=0
 while true; do
@@ -26,7 +35,9 @@ while true; do
   while [ -n "$(ls "$root/e2e/.dev_active" 2>/dev/null)" ]; do sleep 5; done
   set +e
   "$root/tools/gpu_timing.sh" zsh -c '
-    util() { ioreg -r -d 1 -c IOAccelerator | grep -o "\"Device Utilization %\"=[0-9]*" | head -1 | cut -d= -f2 }
+    # no reading counts as busy
+    util() { local u=$(ioreg -r -d 1 -c IOAccelerator | grep -o "\"Device Utilization %\"=[0-9]*" | head -1 | cut -d= -f2); echo ${u:-100} }
+    sleep '"$PAUSE_S"'
     t=0; ok=0; low=0
     while [ $t -lt '"$SETTLE_S"' ]; do
       u=$(util); if [ "$u" -le '"$IDLE_MAX"' ]; then low=$((low+1)); else low=0; fi
@@ -44,12 +55,22 @@ while true; do
     [ "$after" -le '"$AFTER_MAX"' ] || { echo "GPU busy right after the run (${after}%): rejected" >&2; exit 5; }
     exit 0' zsh "$@"
   rc=$?
-  if [ $rc = 0 ] && [ -n "$VALIDATE" ]; then
-    zsh -c "$VALIDATE" >> "$log" 2>&1 || rc=5
+  if [ $rc = 0 ]; then
+    if [ -n "$VALIDATE" ]; then
+      zsh -c "$VALIDATE" >> "$log" 2>&1 || rc=5
+    elif [ -z "${VALIDATE+set}" ]; then
+      for c in $outs; do
+        if [ -f "$c" ]; then "$apy" "$root/e2e/anchor_check.py" "$c" auto >> "$log" 2>&1 || rc=5; fi
+      done
+    fi
   fi
   set -e
   if [ $rc = 5 ]; then
     try=$((try + 1)); mv "$log" "$log.rejected-$try"; echo "$(date +%T) rejected run $try of $log" >&2
+    for c in $outs; do
+      if [ -f "$c" ]; then mv "$c" "$c.rejected-$try"; fi
+      if [ -f "$c.prov.jsonl" ]; then mv "$c.prov.jsonl" "$c.rejected-$try.prov.jsonl"; fi
+    done
     [ $try -lt $MAX_TRIES ] || exit 6
   elif [ $rc != 3 ]; then
     exit $rc

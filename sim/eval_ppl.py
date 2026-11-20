@@ -15,6 +15,12 @@ Methods are either a name from METHODS or a spec "w=<weights>;a=<8|16>;r=<rotati
 calibration Hessians from calib.py (WikiText-2 train), computed once per model.
 Example: --methods "w=gptq:e2m1/B16/M1..8;a=8;r=32". An optional "p=<linear>" (e.g. p=mlp.down_proj) applies activations and rotation to that
 kind of linear layer only; "rp=<linear>" applies only the rotation to that kind, with activations everywhere.
+"o=<k>" (outlier bypass) keeps the k largest-magnitude inputs of every token in float and quantizes the rest to INT8
+with a scale taken from the rest only; it leaves the weight basis alone (no rotation).
+"int8_row" is symmetric INT8 with one scale per output row (the 8-bit option for an MoE's dense projections).
+The MoE scripts (e2e/ppl_qwen35.py, e2e/q38_ppl.py) read specs with parse_scoped: "wd=<weights|bf16>" and
+"ws=<weights|bf16>" give the dense projections / the shared expert a kind of their own.
+<out>.prov.jsonl gets one line of provenance per method (provenance.py).
 """
 import argparse
 import csv
@@ -33,6 +39,7 @@ import calib
 import formats as F
 import gptq as G
 import mx_int8 as q
+import provenance as prov
 from gpu_guard import eval_step
 
 LINEARS = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
@@ -69,6 +76,37 @@ def parse_method(m):
     return (None if w in ("none", "bf16") else w, kv.get("a", "16") == "8", int(kv.get("r", "0")))
 
 
+KINDS = ["mx_spec", "mx_search", "sc_mx", "nvfp4", "nvfp4_search", "int4_g64", "int8_row"]
+
+
+def check_kind(kind, gptq=True):
+    """Stops on a weight kind that fake_weight does not know (before a model is loaded for it)."""
+    ok = kind is None or kind in KINDS or (kind.startswith("fmt:") and kind[4:] in F.FORMATS)
+    if gptq and kind and kind.startswith("gptq:"):
+        ok = kind[5:] in ("sc_mx", "nvfp4_search") or kind[5:] in F.FORMATS
+    if not ok:
+        raise SystemExit(f"unknown weight kind {kind!r}: one of {KINDS}, fmt:<name of formats.FORMATS>"
+                         + (", gptq:<...>" if gptq else " (GPTQ is not available here)"))
+
+
+def parse_scoped(m):
+    """Spec of a mixture-of-experts model: parse_method plus "wd=<kind|bf16>" for the dense projections and
+    "ws=<kind|bf16>" for the shared expert. "w" is the kind of the routed experts, and of every class that has no
+    field of its own. Activations ("a") are the same at every quantized site, whatever its weights.
+    -> (experts kind or None, INT8 activations, rotation block, dense kind or None, shared-expert kind or None)."""
+    if m in METHODS:
+        wk, a8, had = METHODS[m]
+        return wk, a8, had, wk, wk
+    kv = dict(part.split("=", 1) for part in m.split(";"))
+    unknown = set(kv) - {"w", "a", "r", "wd", "ws"}
+    if unknown:
+        raise SystemExit(f"unknown field(s) {sorted(unknown)} in method spec {m!r} (w, a, r, wd, ws)")
+    over = {k: kv.pop(k) for k in ("wd", "ws") if k in kv}
+    wk, a8, had = parse_method(";".join(f"{k}={v}" for k, v in kv.items())) if kv else (None, False, 0)
+    own = {k: (None if v in ("none", "bf16") else v) for k, v in over.items()}
+    return wk, a8, had, own.get("wd", wk), own.get("ws", wk)
+
+
 def fake_weight(w, kind, h=None):
     if kind.startswith("fmt:"):
         return F.quantize_mx(w, F.FORMATS[kind[4:]])[0].astype(np.float64)
@@ -95,14 +133,19 @@ def fake_weight(w, kind, h=None):
         return q.nvfp4_search(w)
     if kind == "int4_g64":
         return q.int4_affine(w, 64)
+    if kind == "int8_row":  # symmetric INT8, one scale per output row
+        s = np.abs(w).max(axis=1, keepdims=True) / 127.0
+        s = np.where(s == 0, 1.0, s)
+        return np.clip(np.rint(w / s), -127, 127) * s
     raise ValueError(kind)
 
 
 class QLinear(nn.Module):
-    def __init__(self, lin, wkind, act8, had, h=None):
+    def __init__(self, lin, wkind, act8, had, h=None, outliers=0):
         super().__init__()
         w = np.array(lin.weight.astype(mx.float32), dtype=np.float64)
         self.had = had
+        self.outliers = outliers
         if had:
             # Rotate the input dimension in blocks: y = (x R)(W R)^T, R block-diagonal orthonormal.
             hb = hadamard(had)
@@ -128,14 +171,23 @@ class QLinear(nn.Module):
             sh = xf.shape
             x = (xf.reshape(*sh[:-1], -1, self.had) @ self.hb).reshape(sh).astype(dt)
         if self.act8:
-            x = act_int8(x)
+            x = act_int8(x, self.outliers)
         y = x @ self.weight.T
         return y if self.bias is None else y + self.bias
 
 
-def act_int8(x):
-    """Symmetric per-token INT8 fake quantization (round half to even, like the Metal kernel's rint)."""
+def act_int8(x, outliers=0):
+    """Symmetric per-token INT8 fake quantization (round half to even, like the Metal kernel's rint).
+    outliers = k > 0: the k largest |x| of each token pass in float; the scale comes from the other coordinates."""
     xf = x.astype(mx.float32)
+    if outliers:
+        ax = mx.abs(xf)
+        thr = mx.sort(ax, axis=-1)[..., -outliers:-outliers + 1] if outliers > 1 else mx.max(ax, axis=-1, keepdims=True)
+        keep = ax >= thr  # the k largest (ties may keep a few more)
+        rest = mx.where(keep, 0.0, xf)
+        s = mx.max(mx.abs(rest), axis=-1, keepdims=True) / 127.0
+        s = mx.where(s == 0, 1.0, s)
+        return mx.where(keep, xf, mx.clip(mx.round(rest / s), -127, 127) * s).astype(x.dtype)
     s = mx.max(mx.abs(xf), axis=-1, keepdims=True) / 127.0
     s = mx.where(s == 0, 1.0, s)
     return (mx.clip(mx.round(xf / s), -127, 127) * s).astype(x.dtype)
@@ -165,6 +217,7 @@ def quantize_model(model, method, repo=None):
     wkind, act8, had = parse_method(method)
     kv = dict(part.split("=", 1) for part in method.split(";") if "=" in part)
     only, rot_only = kv.get("p"), kv.get("rp")
+    outl = int(kv.get("o", "0"))
     if wkind is None and not act8 and not had:
         return
     need_h = bool(wkind) and wkind.startswith("gptq:")
@@ -176,7 +229,7 @@ def quantize_model(model, method, repo=None):
                 h = calib.hessian(repo, i, path) if need_h else None
                 on = only is None or only == path
                 rotated = on and (rot_only is None or rot_only == path)
-                setattr(parent, name, QLinear(getattr(parent, name), wkind, act8 and on, had if rotated else 0, h))
+                setattr(parent, name, QLinear(getattr(parent, name), wkind, act8 and on, had if rotated else 0, h, outl))
         switch = getattr(layer.mlp, "switch_mlp", None)  # MoE experts; the router (mlp.gate) stays BF16
         if switch is not None:
             if had:
@@ -246,6 +299,7 @@ def main():
                 name = m + (" (second half)" if a.second_half else "")
                 wr.writerow([a.repo, name, a.seq, n, f"{ppl:.4f}", f"{time.time() - t0:.0f}"])
                 f.flush()
+                prov.sidecar(a.out, model=a.repo, method=name, seq=a.seq, chunks=n)
                 print(f"{a.repo} {name:24s} ppl {ppl:8.4f}  ({n} x {a.seq} tokens, {time.time() - t0:.0f}s)", flush=True)
                 del model
 

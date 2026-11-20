@@ -3,7 +3,7 @@ matrices (q38_mlx.py). The two systems do not fit in memory together (63 + 66 GB
 system in its own process (protocol of bench_fused.py otherwise: random prompts, 1 s warm-up, 2 untimed runs per
 length, `--reps` timed runs, median), and run_q38_prefill.sh alternates sessions A B A B under run_timed.sh.
 
-Usage (.venv-q38): python bench_q38.py --method fused|fused_b16|mlx_mxfp4|mlx_affine4 [--lengths 512,2048,8192]
+Usage (.venv-q38): python bench_q38.py --method fused|fused_b16|fused_b8|mlx_mxfp4|mlx_affine4 [--lengths 512,2048,8192]
                    [--reps 5] [--out results/10_prefill_q38.csv] [--session N]
 """
 import argparse
@@ -79,7 +79,8 @@ def main():
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     t0 = time.time()
-    sysm = Fused({"fused": "sc", "fused_b16": "e2m1/B16/M1..10"}[a.method]) if a.method.startswith("fused") \
+    sysm = Fused({"fused": "sc", "fused_b16": "e2m1/B16/M1..10", "fused_b8": "e2m1/B8/M1..10"}[a.method]) \
+        if a.method.startswith("fused") \
         else Plain(a.method)
     print(f"{a.method}: loaded in {time.time() - t0:.0f} s, {sysm.weight_bytes / 2**30:.1f} GiB of weights", flush=True)
     lengths = [int(x) for x in a.lengths.split(",")]
@@ -119,11 +120,12 @@ def main():
         new = not os.path.exists(a.out)
         with open(a.out, "a", newline="") as f:
             if new:
-                f.write(f"# {state}\n")
+                f.write(bp.prov.csv_head(state))
             wr = csv.DictWriter(f, fieldnames=list(rows[0]))
             if new:
                 wr.writeheader()
             wr.writerows(rows)
+        bp.prov.sidecar(a.out, power=state, model="qwen38", method=a.method, session=a.session)
 
 
 if __name__ == "__main__":

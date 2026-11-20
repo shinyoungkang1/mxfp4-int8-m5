@@ -79,7 +79,7 @@ def build(model_name, methods, cache_dir):
             if model_name == "qwen3":
                 import fused_qwen3 as fq
                 f = fused.get(m) or fused.setdefault("f", fq.load_fused(repo, cache_dir)[0])
-                d = dec.DecodeQwen3(f, head=head, fuse_prologue=m == "ours_prologue")
+                d = dec.DecodeQwen3(f, head=head, fuse_prologue=True if m == "ours_prologue" else None)
             else:
                 import fused_olmoe as fo
                 f = fused.get(m) or fused.setdefault("f", fo.load_fused_olmoe(repo, cache_dir)[0])
@@ -159,10 +159,11 @@ def main():
                   + (f"  {tps / ref:.3f}x vs mlx_mxfp4" if ref else ""), flush=True)
     if a.out:
         with open(a.out, "w", newline="") as f:
-            f.write(f"# {state}\n")
+            f.write(bp.prov.csv_head(state))
             wr = csv.DictWriter(f, fieldnames=list(rows[0]))
             wr.writeheader()
             wr.writerows(rows)
+        bp.prov.sidecar(a.out, fresh=True, power=state, model=REPOS[a.model], methods=methods)
         print("wrote", a.out)
 
 

@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--ctx", default="512,2048")
     ap.add_argument("--reps", type=int, default=7)
     ap.add_argument("--rot", action="store_true", help="also the same format with rotated inputs (packed by e2e/pack_rot.py)")
+    ap.add_argument("--rot-down", action="store_true", help="also with only the down projection rotated (e2e/pack_rot.py --down-only)")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     mxm = load(os.path.join(CACHE, REPO.split("/")[-1] + "-mxfp4"))[0]
@@ -43,6 +44,8 @@ def main():
     names = {"fused_scmxfp4": f_sc, "fused_" + a.format: f_new}
     if a.rot:
         names["fused_" + a.format + "_rot"] = fq.load_fused(REPO, CACHE, packed="rot:" + a.format)[0]
+    if a.rot_down:
+        names["fused_" + a.format + "_rotdown"] = fq.load_fused(REPO, CACHE, packed="rotdown:" + a.format)[0]
     state = bp.power_state()
     if a.what == "prefill":
         models = {"mlx_mxfp4": bf.Plain(mxm), **{k: bf.Fused(v) for k, v in names.items()}}
@@ -69,16 +72,18 @@ def main():
                 rows.append(dict(method=m, context=c, gen_tokens=128, reps=5, tok_s_median=f"{tps:.1f}",
                                  speedup_vs_mlx_mxfp4=f"{tps / ref:.3f}"))
                 print(f"{m:26s} ctx={c:5d} {tps:7.1f} tok/s  {tps / ref:.3f}x vs mlx_mxfp4", flush=True)
-    rows = [dict(format=a.format, bits_new=f"{f_new.weight_bytes() * 8 / sum(w.N * w.K for _, ws in f_new.layers for w in ws.values()):.3f}",
+    rows = [dict(model=REPO, format=a.format, bits_new=f"{f_new.weight_bytes() * 8 / sum(w.N * w.K for _, ws in f_new.layers for w in ws.values()):.3f}",
                  bits_scmxfp4=f"{f_sc.weight_bytes() * 8 / sum(w.N * w.K for _, ws in f_sc.layers for w in ws.values()):.3f}",
                  **r) for r in rows]
     print("#", state)
     if a.out:
         with open(a.out, "w", newline="") as fh:
-            fh.write(f"# {state}\n")
+            fh.write(bp.prov.csv_head(state))
             wr = csv.DictWriter(fh, fieldnames=list(rows[0]))
             wr.writeheader()
             wr.writerows(rows)
+        bp.prov.sidecar(a.out, fresh=True, power=state, model=REPO, what=a.what, format=a.format, methods=sorted({r["method"] for r in rows}),
+                        head="own" if a.what == "prefill" else "mlx_mxfp4")
         print("wrote", a.out)
 
 

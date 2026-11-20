@@ -26,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import fused_olmoe as fo  # noqa: E402
 import fused_qwen3 as fq  # noqa: E402
+import sc_format as F  # noqa: E402
 import sc_kernels as S  # noqa: E402
 import sc_moe  # noqa: E402
 
@@ -46,7 +47,6 @@ def layer_kind(layer):
 
 
 def _quantize_one(w):
-    import sc_format as F
     return F.quantize(np.asarray(w, np.float64))[:3]
 
 
@@ -57,11 +57,27 @@ def _pack_fmt(w, fmt_name, kfmt):
     return np.asarray(c).reshape(w.shape[0], -1), b, s
 
 
-def pack_qwen35(model, cache_path, workers=14, fmt_name=None):
+ROT_B = 32
+
+
+def rotate_rows(w):
+    """W [N, K] -> W (D H_b) along K, as e2e/ref_qwen35.build_fake and sim/eval_ppl.QLinear (r=32, signs from default_rng(0) for width K), in
+    float64; then x (D H_b) . W (D H_b) = x . W, so the kernels pair it with S.rot_quant on the activations."""
+    sys.path.insert(0, os.path.join(HERE, "..", "sim"))
+    from eval_ppl import hadamard
+    n, k = w.shape
+    signs = np.random.default_rng(0).choice([-1.0, 1.0], size=k)
+    return ((w.astype(np.float64) * signs).reshape(n, -1, ROT_B) @ hadamard(ROT_B)).reshape(n, k).astype(np.float32)
+
+
+def pack_qwen35(model, cache_path, workers=14, fmt_name=None, rot=False):
     """SC-MXFP4 (sim/ reference quantizer) of every W4A8 matrix, 2-bit block codes, or a sim/formats.py format (fmt_name, on the GPU);
-    experts stacked per layer with the shared expert appended as expert E. Cached (about 18 GB)."""
+    experts stacked per layer with the shared expert appended as expert E. Cached (about 18 GB). rot: every packed matrix in the rotated basis
+    (round to nearest, no GPTQ), the kernels of e2e/ref_qwen35.py's "b8_w4a8_r32"; needs fmt_name."""
     if os.path.exists(cache_path):
         return mx.load(cache_path)
+    assert fmt_name or not rot
+    R = rotate_rows if rot else (lambda w: w)  # noqa: E731
     if fmt_name:
         import pack_format as pf
         kfmt = pf.sc_format_of(fmt_name)
@@ -72,7 +88,7 @@ def pack_qwen35(model, cache_path, workers=14, fmt_name=None):
             jobs, keys = [], []
             for paths in DENSE[layer_kind(layer)].values():
                 for p in paths:
-                    jobs.append(np.array(get(layer, p).weight.astype(mx.float32)))
+                    jobs.append(R(np.array(get(layer, p).weight.astype(mx.float32))))
                     keys.append(f"layers.{i}.{p}")
             qmany = (lambda ms, **kw: [_pack_fmt(m, fmt_name, kfmt) for m in ms]) if fmt_name else ex.map
             res = list(qmany(_quantize_one, jobs) if not fmt_name else qmany(jobs))
@@ -81,7 +97,7 @@ def pack_qwen35(model, cache_path, workers=14, fmt_name=None):
             for name in EXPERTS:
                 w = np.array(getattr(layer.mlp.switch_mlp, name).weight.astype(mx.float32))
                 ws = np.array(getattr(layer.mlp.shared_expert, name).weight.astype(mx.float32))
-                mats = list(w) + [ws]
+                mats = [R(m) for m in list(w) + [ws]]
                 res = list(qmany(_quantize_one, mats, chunksize=8) if not fmt_name else qmany(mats))
                 key = f"layers.{i}.experts.{name}"
                 out[key + ".codes"] = np.stack([r[0] for r in res])
@@ -166,8 +182,14 @@ def route(mlp, xn, k):
 
 class FusedQwen35:
     def __init__(self, model, flat, tile_gu=(64, 64, 4), tile_d=(64, 64, 4), bk=64, two_pass="auto",
-                 compiled=True):
+                 compiled=True, rot=False, fmt=None):
         self.model, self.lm = model, model.language_model
+        self.rot, self._signs = rot, {}
+        # fmt: the packed weights' sc_format.Format, installed (S.set_format) at every call (hidden, DecodeQwen35.step),
+        # so that models in different formats can run in one process. fmt_name / pack_path: set by load_fused_qwen35.
+        self.fmt = fmt if fmt is not None else F.Format()
+        self.fmt_name, self.pack_path = None, None
+        S.set_format(self.fmt)
         a = self.args = self.lm.args
         self.eps = mx.array([a.rms_norm_eps], mx.float32)
         self.tile_gu, self.tile_d, self.bk, self.two_pass = tile_gu, tile_d, bk, two_pass
@@ -204,6 +226,30 @@ class FusedQwen35:
         mx.eval([w for _, _, ws, ex in self.layers for w in [*(p.codes for p in ws.values()), *ex["gu"], *ex["down"]]])
         self.record, self.record_layers = None, ()
 
+    # activation quantizers: per-token INT8, or (rot) the 32-wide rotation then per-token INT8 for weights packed with rot=True
+    def signs(self, K):
+        if K not in self._signs:
+            self._signs[K] = S.rot_signs(K)
+            mx.eval(self._signs[K])
+        return self._signs[K]
+
+    def nq(self, h, w, Mp=None):
+        """-> (xq, xs, xn): INT8 of rms_norm(h, w) and the BF16 normalized rows (for the router and in_proj_b / in_proj_a)."""
+        if not self.rot:
+            return S.rmsnorm_quant_n(h, w, self.eps, Mp)
+        xn = mx.fast.rms_norm(h, w, self.args.rms_norm_eps)
+        return (*S.rot_quant(xn, self.signs(h.shape[1]), Mp), xn)
+
+    def q(self, h, w, Mp=None):
+        if not self.rot:
+            return S.rmsnorm_quant(h, w, self.eps, Mp)
+        return S.rot_quant(mx.fast.rms_norm(h, w, self.args.rms_norm_eps), self.signs(h.shape[1]), Mp)
+
+    def aq(self, x, Mp=None):
+        if not self.rot:
+            return S.act_quant(x, Mp)
+        return S.rot_quant(x, self.signs(x.shape[1]), Mp)
+
     def weight_bytes(self):
         n = 0
         for _, _, ws, ex in self.layers:
@@ -213,7 +259,7 @@ class FusedQwen35:
     def _moe_fn(self, L, Mp, dtype, compiled, rec):
         """MoE half of a block (pure function of arrays, compiled per prompt length): post-attention RMSNorm + INT8,
         routing, counting sort, grouped expert GEMMs (incl. the shared expert), combine + residual."""
-        key = (L, Mp, dtype, compiled, rec, self.two_pass, self.tile_gu, self.tile_d, self.bk)
+        key = (L, Mp, dtype, compiled, rec, self.two_pass, self.tile_gu, self.tile_d, self.bk, self.rot)
         if key in self._fns:
             return self._fns[key]
         a, eps = self.args, self.eps
@@ -222,7 +268,7 @@ class FusedQwen35:
         two_pass = self.two_pass if self.two_pass != "auto" else R // E1 >= 256
 
         def moe(h, pn, gate_w, sg_w, cg, bg, sg, cd, bd, sd):
-            xq, xs, xn = S.rmsnorm_quant_n(h, pn, eps)
+            xq, xs, xn = self.nq(h, pn)
             mlp = _Router(gate_w, sg_w)
             inds9, scores9 = route(mlp, xn[:L], k)
             pos, tok_p, e_sorted, off, tstart, maxt = sc_moe.route_sort(inds9, E1, tm)
@@ -232,7 +278,7 @@ class FusedQwen35:
                                        xs_s, tile=self.tile_gu)
             else:
                 act = sc_moe.moe_mm(xq_s, R, cg, bg, sg, off, tstart, maxt, F2, 3, xs_s, tile=self.tile_gu, bk=self.bk)
-            xq2, xs2 = S.act_quant(act, R + tm)
+            xq2, xs2 = self.aq(act, R + tm)
             if two_pass:
                 yd = sc_moe.moe_mm_i8(xq2, R, sc_moe.unpack_experts(cd, bd, D, F2 // 2), sd, off, tstart, maxt, D, 1,
                                       xs2, tile=self.tile_d)
@@ -249,6 +295,7 @@ class FusedQwen35:
 
     def hidden(self, ids, cache):
         from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+        S.set_format(self.fmt)
         a = self.args
         h = self.lm.model.embed_tokens(ids)[0]
         L = h.shape[0]
@@ -263,7 +310,7 @@ class FusedQwen35:
             c = cache[i]
             if kind == "linear":
                 m = layer.linear_attn
-                xq, xs, xn = S.rmsnorm_quant_n(h, layer.input_layernorm.weight, self.eps)
+                xq, xs, xn = self.nq(h, layer.input_layernorm.weight)
                 wq = ws["qkvz"].unpack()
                 y = S.mm_epi(xq, wq, xs, ws["qkvz"].wscale, 1, h.dtype, tile=tq)
                 self._rec(i, "qkvz", h, xq, wq)
@@ -274,13 +321,13 @@ class FusedQwen35:
                 wo = ws["out"]
             else:
                 m = layer.self_attn
-                xq, xs = S.rmsnorm_quant(h, layer.input_layernorm.weight, self.eps)
+                xq, xs = self.q(h, layer.input_layernorm.weight)
                 wq = ws["qkv"].unpack()
                 y = S.mm_epi(xq, wq, xs, ws["qkv"].wscale, 1, h.dtype, tile=tq)
                 self._rec(i, "qkv", h, xq, wq)
                 o = attention_core(m, y[:L][None], fa_mask, c)[0]
                 wo = ws["o"]
-            xq, xs = S.act_quant(o, Mp)
+            xq, xs = self.aq(o, Mp)
             w_o = wo.unpack()
             self._rec(i, "o", o, xq, w_o)
             h = S.mm_epi(xq, w_o, xs, wo.wscale, 2, h.dtype, res=h, tile=tq)
@@ -322,14 +369,20 @@ class _W:
         self.weight = w
 
 
-def load_fused_qwen35(repo=REPO, cache_dir=os.path.expanduser("~/.cache/mxfp4-int8-m5"), fmt_name=None, **kw):
+def load_fused_qwen35(repo=REPO, cache_dir=os.path.expanduser("~/.cache/mxfp4-int8-m5"), fmt_name=None, rot=False, **kw):
     from mlx_lm import load
     model, tok = load(repo, lazy=True)
     if fmt_name:
         import pack_format as pf
-        S.set_format(pf.sc_format_of(fmt_name))
-        path = repo.replace("/", "--") + "-fmt-" + pf.slug(fmt_name) + ".safetensors"
+        fmt = pf.sc_format_of(fmt_name)
+        path = repo.replace("/", "--") + "-fmt-" + pf.slug(fmt_name) + ("-rot32" if rot else "") + ".safetensors"
     else:
+        assert not rot, "rotation needs a sim/formats.py format"
+        fmt = F.Format()  # SC-MXFP4
         path = repo.replace("/", "--") + "-scmxfp4-p2.safetensors"
-    flat = pack_qwen35(model, os.path.join(cache_dir, path), fmt_name=fmt_name)
-    return FusedQwen35(model, flat, **kw), tok
+    S.set_format(fmt)  # pack_qwen35 packs on the GPU with the kernels' format
+    path = os.path.join(cache_dir, path)
+    flat = pack_qwen35(model, path, fmt_name=fmt_name, rot=rot)
+    f = FusedQwen35(model, flat, rot=rot, fmt=fmt, **kw)
+    f.fmt_name, f.pack_path = fmt_name or "scmxfp4", path
+    return f, tok

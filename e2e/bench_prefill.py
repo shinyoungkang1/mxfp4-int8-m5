@@ -30,6 +30,8 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.append(os.path.join(HERE, "..", "sim"))
+import provenance as prov  # noqa: E402  (first: its import time is the recorded start of the run)
 import w4a8_mlx as w  # noqa: E402
 from mlx_lm import load  # noqa: E402
 from mlx_lm.models.cache import make_prompt_cache  # noqa: E402
@@ -127,11 +129,12 @@ def main():
             print(f"{m:12s} L={L:5d}  TTFT {med * 1e3:8.2f} ms  ({L / med:7.0f} tok/s)"
                   + (f"  {ref / med:.2f}x vs mlx_mxfp4" if ref else ""), flush=True)
     with open(a.out, "w", newline="") as f:
-        f.write(f"# {state}\n")
+        f.write(prov.csv_head(state))
         wr = csv.writer(f)
         wr.writerow(["model", "method", "prompt_tokens", "reps", "ttft_ms_median", "ttft_ms_min", "ttft_ms_max",
                      "prefill_tok_s", "speedup_vs_mlx_mxfp4"])
         wr.writerows(rows)
+    prov.sidecar(a.out, fresh=True, power=state, model=a.repo, methods=methods)
     print("wrote", a.out)
 
 

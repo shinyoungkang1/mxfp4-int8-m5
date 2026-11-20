@@ -31,7 +31,13 @@ class DecodeQwen3:
     The fixed-shape parts of a step (before / after attention) run as two mx.compile'd functions, so their ~10
     custom kernels per layer replay without Python overhead; RoPE, the KV cache and SDPA are MLX calls."""
 
-    def __init__(self, fused, head="model", compiled=True, fuse_prologue=False):
+    def __init__(self, fused, head="model", compiled=True, fuse_prologue=None, act_tile=(4, 16, 16, 1)):
+        """fuse_prologue: None (default) = "act" unless the inputs are rotated, else False. act_tile: (rows, values
+        per lane, simdgroups, split K) of the o / down GEMVs when fuse_prologue="act" (at the default tile 256
+        threadgroups each re-quantize the row; 16 simdgroups per threadgroup cut that 8x): 0.978x -> 0.989x MLX MXFP4,
+        logits identical (results/45_prologue_qwen3.csv)."""
+        if fuse_prologue is None:
+            fuse_prologue = False if fused.rot else "act"
         assert fused.epilogue == "gemm"
         self.f, self.model, self.args = fused, fused.model, fused.args
         self.head = _head_fn(fused.model, head)
@@ -54,6 +60,8 @@ class DecodeQwen3:
             # separate rmsnorm_quant kernels; fuse_prologue="act": the per-token INT8 of o and act inside the o / down
             # GEMV prologues (256 threadgroups each), otherwise separate act_quant kernels (default)
             fa = fuse_prologue == "act"
+            assert not (fa and fused.rot), "rotated inputs need a separate rot_quant"
+            tk = {} if act_tile is None else dict(zip(("rows", "vpl", "nsg", "splitk"), act_tile))
 
             def pre(h, c, b, s, inn, qn, kn):
                 xq, xs = fused.rms_q(h, inn, 1)
@@ -62,15 +70,15 @@ class DecodeQwen3:
 
             def post(o, h, co, bo, so, pn, cg, bg, sg, cd, bd, sd):
                 if fa:
-                    h = G.gemv(o, co, bo, None, so, so.size, 2, res=h, pro=1)[None]
+                    h = G.gemv(o, co, bo, None, so, so.size, 2, res=h, pro=1, **tk)[None]
                 else:
                     xq, xs = fused.act_q(o, 1)
                     h = G.gemv(xq, co, bo, xs, so, so.size, 2, res=h)[None]
                 xq, xs = fused.rms_q(h, pn, 1)
                 act = G.gemv(xq, cg, bg, xs, sg, sg.size, 3)
                 if fa:
-                    return G.gemv(act, cd, bd, None, sd, sd.size, 2, res=h, pro=1)[None]
-                xq, xs = fused.act_q(act[None], 1)
+                    return G.gemv(act, cd, bd, None, sd, sd.size, 2, res=h, pro=1, **tk)[None]
+                xq, xs = fused.act_q(act[None], 1, down=True)
                 return G.gemv(xq, cd, bd, xs, sd, sd.size, 2, res=h)[None]
 
         self._pre, self._post = (mx.compile(pre), mx.compile(post)) if compiled else (pre, post)
@@ -93,7 +101,8 @@ class DecodeQwen3:
 
 
 class DecodeOlmoe:
-    def __init__(self, fused, head="model", compiled=True, fuse_prologue=False):
+    def __init__(self, fused, head="model", compiled=True, fuse_prologue=False, o_tile=None):
+        """fuse_prologue="o": only the o projection quantizes its input in the GEMV prologue, at tile o_tile."""
         import fused_olmoe as fo
         self.f, self.model, self.args = fused, fused.model, fused.args
         self.head = _head_fn(fused.model, head)
@@ -102,7 +111,9 @@ class DecodeOlmoe:
         F2, D, k = 2 * a.intermediate_size, a.hidden_size, a.num_experts_per_tok
         pos = mx.arange(k, dtype=mx.int32)
 
-        fp = fuse_prologue
+        fp = fuse_prologue is True
+        fo_ = fuse_prologue in (True, "o")
+        tk = {} if o_tile is None else dict(zip(("rows", "vpl", "nsg", "splitk"), o_tile))
 
         def pre(h, c, b, s, inn, qn, kn):
             if fp:
@@ -113,8 +124,8 @@ class DecodeOlmoe:
             return S.qkv_fullnorm_y(y[None], qn, kn, eps, 1, H, d)
 
         def post(o, h, co, bo, so, pn, gate_w, cg, bg, sg, cd, bd, sd):
-            if fp:
-                h = G.gemv(o, co, bo, None, so, D, 2, res=h, pro=1)[None]
+            if fo_:
+                h = G.gemv(o, co, bo, None, so, D, 2, res=h, pro=1, **tk)[None]
             else:
                 xq, xs = S.act_quant(o, 1)
                 h = G.gemv(xq, co, bo, xs, so, D, 2, res=h)[None]
@@ -159,15 +170,19 @@ class DecodeQwen35:
     GEMVs gather the 8 routed experts and the shared expert (9 slots) themselves; the MoE half of a step is
     mx.compile'd; the DeltaNet recurrence, attention and caches are mlx_lm's code (fused_qwen35.*_core)."""
 
-    def __init__(self, fused, head="model", compiled=True, lean=True, out_prologue=False):
+    def __init__(self, fused, head="model", compiled=True, lean=True, out_prologue=True, out_tile=(4, 16, 16, 2)):
         """lean: the routed experts' indices go to the GEMVs as argpartition returns them, the shared expert is
         the GEMVs' implicit 9th slot and its gate a separate combine input (no casts / concatenations), and the
         down GEMV quantizes its input rows itself (PRO 1); outputs are identical to lean=False. out_prologue: the
-        attention output projection also quantizes its input itself."""
+        DeltaNet / attention output projections also quantize their input themselves, at tile out_tile (rows,
+        values per lane, simdgroups, split K; 16 simdgroups so that 64 threadgroups, not 256, re-quantize the
+        4096-wide row): 0.18-0.22 ms per token faster than a separate act_quant kernel on the 35B, logits identical
+        (results/43_tune_dense35.csv). out_prologue=False, out_tile=None is the earlier path."""
         import fused_olmoe as fo
         import fused_qwen35 as fz
         self.f, self.model, self.args = fused, fused.model, fused.args
-        self.out_prologue = out_prologue
+        self.out_prologue = out_prologue and not fused.rot  # rotated inputs need a separate rot_quant
+        self.out_kw = {} if out_tile is None else dict(zip(("rows", "vpl", "nsg", "splitk"), out_tile))
         self.head = head.language_model.lm_head if head != "model" else fused.lm.lm_head
         self.fz = fz
         a, eps = self.args, fused.eps
@@ -175,18 +190,18 @@ class DecodeQwen35:
         pos = mx.arange(k + 1, dtype=mx.int32)
 
         def moe(h, pn, gate_w, sg_w, cg, bg, sg, cd, bd, sd):
-            xq, xs, xn = S.rmsnorm_quant_n(h, pn, eps, 1)
+            xq, xs, xn = fused.nq(h, pn, 1)
             inds9, scores9 = fz.route(fz._Router(gate_w, sg_w), xn, k)
             e = inds9.reshape(-1)
             act = G.gemv(xq, cg, bg, xs, sg, F2, 3, eidx=e, xstride=0)  # [9, F]
-            xq2, xs2 = S.act_quant(act, k + 1)
+            xq2, xs2 = fused.aq(act, k + 1)
             yd = G.gemv(xq2, cd, bd, xs2, sd, D, 1, eidx=e, xstride=1)  # [9, D]
             return fo.moe_combine(yd, pos, scores9, h, pn, eps, 1, quant=False)[0]
 
         E = a.num_experts
 
         def moe_lean(h, pn, gate_w, sg_w, cg, bg, sg, cd, bd, sd):
-            xq, xs, xn = S.rmsnorm_quant_n(h, pn, eps, 1)
+            xq, xs, xn = fused.nq(h, pn, 1)
             gates = mx.softmax(xn @ gate_w.T, axis=-1, precise=True)  # = fz.route, without the 9-slot arrays
             inds = mx.stop_gradient(mx.argpartition(gates, kth=-k, axis=-1)[..., -k:])
             scores = mx.take_along_axis(gates, inds, axis=-1)
@@ -194,20 +209,25 @@ class DecodeQwen35:
             sig = mx.sigmoid(xn @ sg_w.T)
             e = inds.reshape(-1)
             act = G.gemv(xq, cg, bg, xs, sg, F2, 3, eidx=e, xstride=0, shared=E)  # [9, F]
-            yd = G.gemv(act, cd, bd, None, sd, D, 1, eidx=e, xstride=1, shared=E, pro=1)  # [9, D]
+            if fused.rot:  # rotated inputs: a separate rot_quant of the 9 rows instead of the per-row INT8 in the GEMV prologue
+                xq2, xs2 = fused.aq(act, k + 1)
+                yd = G.gemv(xq2, cd, bd, xs2, sd, D, 1, eidx=e, xstride=1, shared=E)
+            else:
+                yd = G.gemv(act, cd, bd, None, sd, D, 1, eidx=e, xstride=1, shared=E, pro=1)  # [9, D]
             return fo.moe_combine_split(yd, pos, scores, sig.reshape(-1).astype(scores.dtype), h, pn, eps, 1)[0]
 
         fn = moe_lean if lean else moe
         self._moe = mx.compile(fn) if compiled else fn
 
     def step(self, tok, cache):
+        S.set_format(self.f.fmt)  # the kernels' format is a process global; two formats can be timed in one process
         f, fz = self.f, self.fz
         h = self.model.language_model.model.embed_tokens(tok)[0]  # [1, D]
         for i, (layer, kind, ws, ex) in enumerate(f.layers):
             c = cache[i]
             if kind == "linear":
                 m = layer.linear_attn
-                xq, xs, xn = S.rmsnorm_quant_n(h, layer.input_layernorm.weight, f.eps, 1)
+                xq, xs, xn = f.nq(h, layer.input_layernorm.weight, 1)
                 w = ws["qkvz"]
                 y = G.gemv(xq, w.codes, w.bcodes, xs, w.wscale, w.N, 1)
                 nqkv = 2 * m.key_dim + m.value_dim
@@ -217,15 +237,16 @@ class DecodeQwen35:
                 wo = ws["out"]
             else:
                 m = layer.self_attn
-                xq, xs = S.rmsnorm_quant(h, layer.input_layernorm.weight, f.eps, 1)
+                xq, xs = f.q(h, layer.input_layernorm.weight, 1)
                 w = ws["qkv"]
                 y = G.gemv(xq, w.codes, w.bcodes, xs, w.wscale, w.N, 1)
                 o = fz.attention_core(m, y[None, None], None, c)[0]
                 wo = ws["o"]
             if self.out_prologue:
-                h = G.gemv(o, wo.codes, wo.bcodes, None, wo.wscale, wo.N, 2, res=h, pro=1)[None]
+                assert not f.rot
+                h = G.gemv(o, wo.codes, wo.bcodes, None, wo.wscale, wo.N, 2, res=h, pro=1, **self.out_kw)[None]
             else:
-                xq, xs = S.act_quant(o, 1)
+                xq, xs = f.aq(o, 1)
                 h = G.gemv(xq, wo.codes, wo.bcodes, xs, wo.wscale, wo.N, 2, res=h)[None]
             h = self._moe(h, layer.post_attention_layernorm.weight, layer.mlp.gate.weight,
                           layer.mlp.shared_expert_gate.weight, *ex["gu"], *ex["down"])
