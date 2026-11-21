@@ -9,6 +9,10 @@ three. This repository contains the spread-constrained quantizer (SC-MXFP4), the
 W4A8 kernels for the M5 inside MLX (dense and grouped-MoE prefill, batch-1 decode), and the benchmark and evaluation
 scripts behind the paper's results.
 
+## Blog
+
+- [Which operand types does the M5 GPU's matrix unit speed up?](blog/01_m5_matmul_operand_types.md)
+
 ## Requirements
 
 - A Mac with an Apple M5-family chip (the paper's numbers are from an M5 Max with 128 GB), macOS 26 with Metal 4, and
