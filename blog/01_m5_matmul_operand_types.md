@@ -1,6 +1,6 @@
 # Which operand types does the M5 GPU's matrix unit speed up?
 
-*November 2026 · first post in a series on running 4-bit language models through the M5's integer matrix path*
+*November 2026 · first post in a series on running 4-bit language models through the M5's integer matrix path · also on the blog at [shinyoungkang1.github.io](https://shinyoungkang1.github.io/blog/m5-matmul-operand-types/)*
 
 Integer times integer, and nothing else. On an M5 Max, a matrix multiply with both operands in INT8 runs at 1.79–1.98× the FP16 rate. As soon as one operand is a float, the multiply runs at the FP16 rate or below it. That includes the FP4 and FP8 operand types that macOS 27 added.
 

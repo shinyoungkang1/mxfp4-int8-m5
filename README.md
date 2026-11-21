@@ -11,7 +11,7 @@ scripts behind the paper's results.
 
 ## Blog
 
-- [Which operand types does the M5 GPU's matrix unit speed up?](blog/01_m5_matmul_operand_types.md)
+- [Which operand types does the M5 GPU's matrix unit speed up?](https://shinyoungkang1.github.io/blog/m5-matmul-operand-types/) ([copy in this repository](blog/01_m5_matmul_operand_types.md))
 
 ## Requirements
 
